@@ -76,5 +76,5 @@ Settings are stored as JSON under the OS config directory: `BacongrisCTIAgent/se
 
 ## CI and packaging
 
-- **CI** (`.github/workflows/ci.yml`) — runs the Vite build and `tauri build` on Ubuntu, macOS, and Windows for every push/PR.
+- **CI** (`.github/workflows/ci.yml`) — runs the Vite build and `tauri build` on Ubuntu, macOS, and Windows for every push/PR, and **uploads installers as workflow artifacts** (`bacongris-windows-installer`, `bacongris-macos-bundle`, `bacongris-linux-packages` — appear at the bottom of the **run summary** after a green build).
 - **Package** (`.github/workflows/release.yml`, **manual** via **Actions → run workflow**) — builds a **universal macOS `.dmg`** and a **Windows NSIS `.exe`**, uploaded as **workflow artifacts** (for your own testing). It does **not** create a public GitHub Release; that can be wired in when you are ready to ship.
