@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use crate::audit::append_audit;
-use crate::settings::{load_settings, resolve_workspace_dir};
+use crate::app_data::AppStore;
+use tauri::Manager;
 
 const MAX_SCAN_DEPTH: usize = 5;
 const MAX_FILES_COLLECTED: usize = 800;
@@ -791,8 +792,8 @@ pub fn analyze_workspace_run_requirements(
     full_workspace: Option<bool>,
     use_cache: Option<bool>,
 ) -> Result<WorkspaceRunAnalysis, String> {
-    let settings = load_settings(&app)?;
-    let root = resolve_workspace_dir(&settings)?;
+    let store = app.state::<AppStore>();
+    let root = store.effective_workspace_path(&app)?;
     fs::create_dir_all(&root).map_err(|e| format!("workspace: {e}"))?;
     let scripts_dir = root.join("scripts");
     fs::create_dir_all(&scripts_dir).map_err(|e| format!("scripts: {e}"))?;
