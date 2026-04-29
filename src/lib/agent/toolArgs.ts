@@ -46,6 +46,17 @@ export function coercePathArg(args: Record<string, unknown>): string {
   ]);
 }
 
+/** Full file body for **write_text_file** (UTF-8). */
+export function coerceFileContentArg(args: Record<string, unknown>): string {
+  return pickString(args, [
+    "content",
+    "text",
+    "body",
+    "value",
+    "string",
+  ]);
+}
+
 export function coerceProgramArg(args: Record<string, unknown>): string {
   return pickString(args, ["program", "Program", "executable", "cmd", "command"]);
 }
@@ -151,16 +162,38 @@ export function getRunCommandArgv(
   return [];
 }
 
-/** One block of text to send to the integrated terminal PTY. */
+const TERMINAL_TEXT_KEYS = [
+  "text",
+  "data",
+  "input",
+  "command",
+  "line",
+  "buffer",
+] as const;
+
+/**
+ * One block of text to send to the integrated terminal PTY.
+ * Must **not** use `trim()`: a trailing newline is what submits the line to the shell. We
+ * `trimStart` only. Also fixes models that end with literal `\\` + `n` instead of a real `\n`.
+ * If there is still no end-of-line, appends `\n` so the line runs without the user pressing Enter.
+ */
 export function coerceTerminalDataArg(args: Record<string, unknown>): string {
-  return pickString(args, [
-    "text",
-    "data",
-    "input",
-    "command",
-    "line",
-    "buffer",
-  ]);
+  let s = "";
+  for (const k of TERMINAL_TEXT_KEYS) {
+    const v = args[k];
+    if (typeof v === "string" && v.length > 0) {
+      s = v;
+      break;
+    }
+  }
+  if (s.length === 0) return "";
+  s = s.replace(/^\s+/, "");
+  // Some models end the string with two chars backslash + n (wrong) instead of a real newline.
+  s = s.replace(/\\r\\n$/, "\r\n").replace(/\\n$/, "\n");
+  if (!/[\n\r]\s*$/.test(s)) {
+    s = s + "\n";
+  }
+  return s;
 }
 
 /**
@@ -249,5 +282,104 @@ export function parseAnalyzeWorkspaceCallArgs(
     workflowRelativePath: w || null,
     fullWorkspace: full,
     useCache: !noCache,
+  };
+}
+
+/** IOC tool args: models sometimes use camelCase. */
+export function pickOptString(
+  args: Record<string, unknown>,
+  keys: string[],
+): string | undefined {
+  for (const k of keys) {
+    const v = args[k];
+    if (typeof v === "string" && v.length > 0) return v;
+  }
+  return undefined;
+}
+
+function pickOptI64(
+  args: Record<string, unknown>,
+  keys: string[],
+): number | undefined {
+  for (const k of keys) {
+    const v = args[k];
+    if (typeof v === "number" && Number.isFinite(v)) return Math.trunc(v);
+    if (typeof v === "string" && v.trim() !== "" && /^-?\d+$/.test(v.trim())) {
+      return parseInt(v.trim(), 10);
+    }
+  }
+  return undefined;
+}
+
+/** Parse ioc_update / ioc_create–style optional string fields. */
+export function parseIocStringFields(args: Record<string, unknown>): {
+  value: string | undefined;
+  iocType: string | undefined;
+  source: string | undefined;
+  campaignTag: string | undefined;
+  profileId: string | undefined;
+  id: string | undefined;
+  json: string | undefined;
+} {
+  return {
+    value: pickOptString(args, ["value", "ioc", "iocValue", "val", "indicator"]) ?? undefined,
+    iocType: pickOptString(args, [
+      "ioc_type",
+      "iocType",
+      "type",
+      "ioc_type_hint",
+    ]),
+    source: pickOptString(args, ["source", "src"]),
+    campaignTag: pickOptString(args, ["campaign_tag", "campaignTag", "campaign"]),
+    profileId: pickOptString(args, ["profile_id", "profileId"]),
+    id: pickOptString(args, ["id", "ioc_id", "iocId"]),
+    json: pickOptString(args, [
+      "json",
+      "stix",
+      "misp",
+      "data",
+      "content",
+      "body",
+      "raw",
+    ]),
+  };
+}
+
+export function parseIocSearchArgs(
+  args: Record<string, unknown>,
+): {
+  valueContains: string | undefined;
+  iocType: string | undefined;
+  campaign: string | undefined;
+  source: string | undefined;
+  profileId: string | undefined;
+  allProfiles: boolean;
+  includeFalsePositives: boolean;
+  limit: number | undefined;
+} {
+  const all =
+    args.all_profiles === true ||
+    args.allProfiles === true ||
+    args.all_profiles === "true" ||
+    args.allProfiles === "true";
+  const includeFp =
+    args.include_false_positives === true ||
+    args.includeFalsePositives === true ||
+    args.include_false_positives === "true" ||
+    args.includeFalsePositives === "true";
+  return {
+    valueContains: pickOptString(args, [
+      "value_contains",
+      "valueContains",
+      "q",
+      "query",
+    ]),
+    iocType: pickOptString(args, ["ioc_type", "iocType", "type"]),
+    campaign: pickOptString(args, ["campaign", "campaign_tag", "campaignTag"]),
+    source: pickOptString(args, ["source", "src"]),
+    profileId: pickOptString(args, ["profile_id", "profileId"]),
+    allProfiles: all,
+    includeFalsePositives: includeFp,
+    limit: pickOptI64(args, ["limit", "max", "count"]),
   };
 }

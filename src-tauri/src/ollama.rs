@@ -46,9 +46,41 @@ async fn chat_with_settings_ex(
         .build()
         .map_err(|e| format!("http client: {e}"))?;
 
+    // Retry logic with exponential backoff
+    const MAX_RETRIES: u32 = 3;
+    let mut last_error = String::new();
+    
+    for attempt in 0..MAX_RETRIES {
+        if attempt > 0 {
+            // Exponential backoff: 1s, 2s, 4s
+            let delay = std::time::Duration::from_secs(2u64.pow(attempt - 1));
+            tokio::time::sleep(delay).await;
+        }
+
+        match try_chat(&client, &url, &body).await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                last_error = e;
+                // Only retry on connection errors, not on HTTP 4xx/5xx
+                if !last_error.contains("running") && !last_error.contains("connect") {
+                    return Err(last_error);
+                }
+                continue;
+            }
+        }
+    }
+    
+    Err(format!("{} (tried {} times)", last_error, MAX_RETRIES))
+}
+
+async fn try_chat(
+    client: &reqwest::Client,
+    url: &str,
+    body: &Value,
+) -> Result<Value, String> {
     let res = client
-        .post(&url)
-        .json(&body)
+        .post(url)
+        .json(body)
         .send()
         .await
         .map_err(|e| format!("Ollama request failed (is Ollama running?): {e}"))?;

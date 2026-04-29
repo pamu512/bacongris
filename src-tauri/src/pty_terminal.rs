@@ -1,7 +1,7 @@
 //! Integrated terminal (real PTY) — Cursor-style shell in the app.
 
 use crate::gui_spawn_env::{clear_stale_docker_host, merged_path};
-use crate::settings::{load_settings, resolve_workspace_dir};
+use crate::app_data::AppStore;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
@@ -181,8 +181,8 @@ fn default_terminal_cwd(app: &AppHandle, cwd: Option<String>) -> Result<String, 
             return Ok(t.to_string());
         }
     }
-    let settings = load_settings(app)?;
-    let w = resolve_workspace_dir(&settings)?;
+    let store = app.state::<AppStore>();
+    let w = store.effective_workspace_path(app)?;
     std::fs::create_dir_all(&w).map_err(|e| format!("workspace: {e}"))?;
     Ok(w.to_string_lossy().into_owned())
 }

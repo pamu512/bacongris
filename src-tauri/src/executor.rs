@@ -1,10 +1,19 @@
+use crate::active_run::{set_active_pid, ActiveRunState, ClearActiveOnDrop};
 use crate::audit::append_audit;
 use crate::gui_spawn_env::{clear_stale_docker_host, merged_path};
-use crate::paths::{join_workspace_path_for_display, resolve_path_for_filesystem_tools, resolve_program_path};
-use crate::settings::{load_settings, AppSettings};
-use crate::workspace::workspace_info_from_settings;
+use crate::paths::{
+    is_bare_executable_name, join_workspace_path_for_display, lookup_bare_in_path,
+    resolve_path_for_write, resolve_path_for_filesystem_tools, resolve_program_path,
+};
+use crate::persist_io::write_with_backup;
+use crate::session::SessionAllowlist;
+use crate::app_data::merged_settings_for_runtime;
+use crate::settings::AppSettings;
+use crate::workspace::workspace_info_for_app;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use tauri::State;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
@@ -35,6 +44,46 @@ fn augment_command_env(cmd: &mut Command) {
     }
 }
 
+#[derive(Debug, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum RiskFlag {
+    NetworkActivity,
+    CredentialAccess,
+    PrivilegeEscalation,
+    FileExfiltration,
+    SuspiciousPattern,
+    DestructiveOperation,
+    ExternalDownload,
+    CodeExecution,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RiskAssessment {
+    pub flags: Vec<RiskFlag>,
+    pub risk_level: RiskLevel,
+    pub requires_confirmation: bool,
+    pub pattern_signature: String, // For session-based memory
+}
+
+#[derive(Debug, Serialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum RiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProgramDeny {
+    pub requested: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_path: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandResult {
@@ -43,6 +92,10 @@ pub struct CommandResult {
     pub stderr: String,
     pub truncated: bool,
     pub timed_out: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denied: Option<ProgramDeny>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk_assessment: Option<RiskAssessment>,
 }
 
 #[derive(Debug, Serialize)]
@@ -110,20 +163,239 @@ fn augment_read_text_file_error(user_path: &str, inner: String, settings: &AppSe
     inner
 }
 
+/// Risky command patterns that may indicate AI escape attempts
+const RISK_PATTERNS: &[(&str, RiskFlag, &str)] = &[
+    // Network activity
+    (r"(?i)curl\s+.*\|\s*(ba)?sh", RiskFlag::ExternalDownload, "curl piped to shell"),
+    (r"(?i)wget\s+.*\|\s*(ba)?sh", RiskFlag::ExternalDownload, "wget piped to shell"),
+    (r"(?i)fetch\s+.*\|\s*(ba)?sh", RiskFlag::ExternalDownload, "fetch piped to shell"),
+    (r"(?i)nc\s+-[el].*-[el]", RiskFlag::NetworkActivity, "netcat listener (potential backdoor)"),
+    (r"(?i)ncat\s+-[el].*-[el]", RiskFlag::NetworkActivity, "ncat listener"),
+    (r"(?i)python\s+-m\s+http\.server", RiskFlag::NetworkActivity, "HTTP server"),
+    (r"(?i)simplehttpserver", RiskFlag::NetworkActivity, "Python HTTP server"),
+    
+    // Credential access
+    (r"(?i)cat\s+.*\.(env|credentials|aws|ssh|key|pem|p12|pfx)", RiskFlag::CredentialAccess, "credential file access"),
+    (r"(?i)cat\s+.*/\.aws/", RiskFlag::CredentialAccess, "AWS credentials"),
+    (r"(?i)cat\s+.*/\.ssh/", RiskFlag::CredentialAccess, "SSH keys"),
+    (r"(?i)cat\s+.*/\.env", RiskFlag::CredentialAccess, "environment files"),
+    
+    // Privilege escalation
+    (r"(?i)sudo\s+", RiskFlag::PrivilegeEscalation, "sudo command"),
+    (r"(?i)su\s+-", RiskFlag::PrivilegeEscalation, "switch user"),
+    (r"(?i)pkexec\s+", RiskFlag::PrivilegeEscalation, "pkexec privilege escalation"),
+    (r"(?i)doas\s+", RiskFlag::PrivilegeEscalation, "doas privilege escalation"),
+    
+    // Code execution
+    (r"(?i)eval\s*\(", RiskFlag::CodeExecution, "eval()"),
+    (r"(?i)exec\s*\(", RiskFlag::CodeExecution, "exec()"),
+    (r"(?i)__import__\s*\(\s*os", RiskFlag::CodeExecution, "dynamic import os"),
+    (r"(?i)subprocess\.call\s*\(", RiskFlag::CodeExecution, "subprocess call"),
+    (r"(?i)os\.system\s*\(", RiskFlag::CodeExecution, "os.system()"),
+    (r"(?i)os\.popen\s*\(", RiskFlag::CodeExecution, "os.popen()"),
+    
+    // Suspicious encodings
+    (r"(?i)base64\s+.*\|.*(?:sh|bash|python|ruby|perl)", RiskFlag::SuspiciousPattern, "base64 decode to shell"),
+    (r"(?i)(?:xxd|od)\s+.*\|", RiskFlag::SuspiciousPattern, "hex dump piped"),
+    
+    // Destructive operations
+    (r"(?i)rm\s+-rf\s+/", RiskFlag::DestructiveOperation, "recursive root delete"),
+    (r"(?i)rm\s+.*--no-preserve-root", RiskFlag::DestructiveOperation, "no preserve root"),
+    (r"(?i)dd\s+if=.*of=/dev/(sd|hd|disk|nvme)", RiskFlag::DestructiveOperation, "disk overwrite"),
+    (r"(?i)mkfs\.", RiskFlag::DestructiveOperation, "filesystem creation"),
+    (r"(?i)>\s*/etc/passwd", RiskFlag::DestructiveOperation, "password file overwrite"),
+    (r"(?i)>\s+/etc/shadow", RiskFlag::DestructiveOperation, "shadow file overwrite"),
+    
+    // File exfiltration (reading sensitive locations)
+    (r"(?i)cat\s+/etc/(passwd|shadow|hosts|resolv\.conf)", RiskFlag::FileExfiltration, "system file read"),
+    (r"(?i)cat\s+/proc/\d+/environ", RiskFlag::FileExfiltration, "process environment"),
+    (r"(?i)cat\s+/proc/\d+/cmdline", RiskFlag::FileExfiltration, "process command line"),
+];
+
+/// Analyzes command for risky patterns
+fn analyze_risk(program: &str, args: &[String]) -> RiskAssessment {
+    let mut flags = Vec::new();
+    let mut matched_patterns = Vec::new();
+    
+    // Combine program and args for analysis
+    let command_str = format!("{} {}", program, args.join(" "));
+    let lower_cmd = command_str.to_lowercase();
+    
+    for (pattern, flag, description) in RISK_PATTERNS {
+        if let Ok(regex) = regex::Regex::new(pattern) {
+            if regex.is_match(&command_str) || regex.is_match(&lower_cmd) {
+                if !flags.contains(flag) {
+                    flags.push(flag.clone());
+                }
+                matched_patterns.push(*description);
+            }
+        }
+    }
+    
+    // Additional heuristic checks
+    if program == "python3" || program == "python" || program == "py" {
+        // Check for inline Python that looks suspicious
+        for arg in args {
+            if arg.contains("import os") && arg.contains("system") {
+                if !flags.contains(&RiskFlag::CodeExecution) {
+                    flags.push(RiskFlag::CodeExecution);
+                }
+            }
+            if arg.contains("import subprocess") {
+                if !flags.contains(&RiskFlag::CodeExecution) {
+                    flags.push(RiskFlag::CodeExecution);
+                }
+            }
+            if arg.contains("__import__('os')") || arg.contains("__import__(\"os\")") {
+                if !flags.contains(&RiskFlag::CodeExecution) {
+                    flags.push(RiskFlag::CodeExecution);
+                }
+            }
+        }
+    }
+    
+    // Determine risk level and if confirmation is required
+    let (risk_level, requires_confirmation) = if flags.is_empty() {
+        (RiskLevel::Low, false)
+    } else if flags.contains(&RiskFlag::DestructiveOperation) || 
+              flags.contains(&RiskFlag::PrivilegeEscalation) {
+        (RiskLevel::Critical, true)
+    } else if flags.contains(&RiskFlag::ExternalDownload) || 
+              flags.contains(&RiskFlag::CredentialAccess) {
+        (RiskLevel::High, true)
+    } else if flags.len() >= 2 {
+        (RiskLevel::High, true)
+    } else {
+        (RiskLevel::Medium, true)
+    };
+    
+    // Create a signature for this pattern (for session-based memory)
+    let pattern_signature = if matched_patterns.is_empty() {
+        format!("{}:{}", program, args.join(" "))
+    } else {
+        format!("{}:{}", program, matched_patterns.join(","))
+    };
+    
+    RiskAssessment {
+        flags,
+        risk_level,
+        requires_confirmation,
+        pattern_signature,
+    }
+}
+
+/// Map a host file argument to `/workspace/...` in the container if it lies under the work tree.
+fn map_arg_for_docker_sandbox(arg: &str, work_dir: &Path) -> Result<String, String> {
+    let p = Path::new(arg);
+    if !p.is_absolute() {
+        return Ok(arg.to_string());
+    }
+    let c = dunce::canonicalize(p)
+        .map_err(|e| format!("{arg} ({e}) — resolve paths before running in Docker"))?;
+    if c.starts_with(work_dir) {
+        let rel = c
+            .strip_prefix(work_dir)
+            .map_err(|_| "path under work dir: strip failed".to_string())?;
+        let rel = rel
+            .to_str()
+            .ok_or("path must be UTF-8 in docker sandbox (absolute path to script)")?;
+        let rel = rel.replace('\\', "/");
+        return Ok(format!("/workspace/{}", rel.trim_start_matches('/')));
+    }
+    Err(format!(
+        "Docker sandbox: absolute paths must be under the work directory ({}). Got: {arg}",
+        work_dir.display()
+    ))
+}
+
+fn build_docker_sandbox_invocation(
+    settings: &AppSettings,
+    docker_bin: &Path,
+    prog_canon: &Path,
+    args: &[String],
+    host_cwd: &Path,
+) -> Result<(PathBuf, Vec<String>), String> {
+    let image = settings.docker_sandbox_image.trim();
+    let image = if image.is_empty() {
+        "python:3.12-slim"
+    } else {
+        image
+    };
+    let wd = dunce::canonicalize(host_cwd)
+        .map_err(|e| format!("docker: canonicalize work dir: {e}"))?;
+    let v_src = wd
+        .to_str()
+        .ok_or("docker: work path must be UTF-8 to mount into the container")?;
+    let exe = prog_canon
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("docker: could not read executable name")?
+        .to_string();
+    let mut inner: Vec<String> = vec![exe];
+    for a in args {
+        inner.push(map_arg_for_docker_sandbox(a, &wd)?);
+    }
+    let mut d = vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "-i".to_string(),
+        "--network=none".to_string(),
+    ];
+    d.push("-v".to_string());
+    d.push(format!("{v_src}:/workspace:rw"));
+    d.push("-w".to_string());
+    d.push("/workspace".to_string());
+    d.push("--memory=512m".to_string());
+    d.push(image.to_string());
+    d.extend(inner);
+    Ok((docker_bin.to_path_buf(), d))
+}
+
 #[tauri::command]
 pub async fn run_command(
     app: tauri::AppHandle,
+    state: State<'_, SessionAllowlist>,
+    active_run: State<'_, ActiveRunState>,
     program: String,
     args: Vec<String>,
     cwd: Option<String>,
 ) -> Result<CommandResult, String> {
-    let settings = load_settings(&app)?;
+    let settings = merged_settings_for_runtime(&app)?;
     let program = program.trim().to_string();
     if program.is_empty() {
         return Err("program is empty".into());
     }
     let program_path = PathBuf::from(&program);
-    let prog_canon = resolve_program_path(&program_path, &settings)?;
+    let log_args = args.clone();
+    let session_snapshot: HashSet<String> = state
+        .paths
+        .lock()
+        .map_err(|_| "could not read session allowlist".to_string())?
+        .clone();
+
+    let prog_canon = match resolve_program_path(&program_path, &settings, Some(&session_snapshot)) {
+        Ok(p) => p,
+        Err(e) => {
+            let suggested = if is_bare_executable_name(&program) {
+                lookup_bare_in_path(&program).map(|p| p.to_string_lossy().into_owned())
+            } else {
+                None
+            };
+            return Ok(CommandResult {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: e.clone(),
+                truncated: false,
+                timed_out: false,
+                denied: Some(ProgramDeny {
+                    requested: program,
+                    reason: e,
+                    suggested_path: suggested,
+                }),
+                risk_assessment: None,
+            });
+        }
+    };
 
     let cwd_canon: PathBuf = match &cwd {
         None => prog_canon
@@ -140,18 +412,50 @@ pub async fn run_command(
         }
     };
 
+    // Analyze command risk before execution
+    let risk_assessment = analyze_risk(&program, &args);
+    
+    // TODO: In the future, check session-based pattern memory here
+    // If pattern was confirmed this session, auto-approve
+    // For now, we return the assessment and let frontend handle confirmation
+
     let max = settings.max_output_bytes.max(1024);
     let dur = Duration::from_secs(settings.execution_timeout_secs.max(1));
 
-    let mut child = Command::new(&prog_canon);
+    let (spawn_prog, spawn_argv) = if settings.use_docker_sandbox {
+        let docker_bin = resolve_program_path(
+            std::path::Path::new("docker"),
+            &settings,
+            Some(&session_snapshot),
+        )
+        .map_err(|e| {
+            format!("Docker sandbox is on in Settings but the docker CLI is not allowlisted/resolved: {e}")
+        })?;
+        build_docker_sandbox_invocation(
+            &settings,
+            &docker_bin,
+            &prog_canon,
+            &args,
+            &cwd_canon,
+        )?
+    } else {
+        (prog_canon, args)
+    };
+
+    let mut child = Command::new(&spawn_prog);
     augment_command_env(&mut child);
     let mut child = child
-        .args(&args)
+        .args(&spawn_argv)
         .current_dir(&cwd_canon)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to spawn process: {e}"))?;
+
+    if let Some(pid) = child.id() {
+        set_active_pid(&active_run, pid);
+    }
+    let _clear_run = ClearActiveOnDrop::new(app.clone());
 
     let stdout = child
         .stdout
@@ -199,7 +503,8 @@ pub async fn run_command(
 
     let detail = serde_json::json!({
         "program": program,
-        "args": args,
+        "args": log_args,
+        "dockerSandbox": settings.use_docker_sandbox,
         "cwd": cwd,
         "exitCode": exit_code,
         "timedOut": timed_out,
@@ -213,12 +518,14 @@ pub async fn run_command(
         stderr,
         truncated,
         timed_out,
+        denied: None,
+        risk_assessment: Some(risk_assessment),
     })
 }
 
 #[tauri::command]
 pub fn read_text_file(app: tauri::AppHandle, path: String) -> Result<String, String> {
-    let settings = load_settings(&app)?;
+    let settings = merged_settings_for_runtime(&app)?;
     let path = path.trim().to_string();
     if path.is_empty() {
         return Err("path is empty".into());
@@ -247,9 +554,58 @@ pub fn read_text_file(app: tauri::AppHandle, path: String) -> Result<String, Str
     String::from_utf8(bytes).map_err(|e| format!("file is not valid UTF-8: {e}"))
 }
 
+/// Writes a UTF-8 string to a file under allowlisted roots. Replaces the file if it exists; creates
+/// parent directories. **Backup:** on overwrite, the previous file is kept as
+/// "filename.backup.<timestamp>" next to the file (see persist_io). Max size scales with
+/// Settings → max output.
+#[tauri::command]
+pub fn write_text_file(
+    app: tauri::AppHandle,
+    path: String,
+    content: String,
+) -> Result<serde_json::Value, String> {
+    let settings = merged_settings_for_runtime(&app)?;
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err("path is empty".into());
+    }
+    let p = Path::new(&path);
+    let max_bytes = settings
+        .max_output_bytes
+        .saturating_mul(2)
+        .max(256 * 1024)
+        .min(4 * 1024 * 1024);
+    if content.len() > max_bytes {
+        return Err(format!(
+            "content is {} bytes; max is {} (based on max output in Settings, capped at 4 MiB).",
+            content.len(),
+            max_bytes
+        ));
+    }
+    let target = resolve_path_for_write(p, &settings)?;
+    if target.is_dir() {
+        return Err("refusing to write: path is a directory".into());
+    }
+    write_with_backup(&target, &content)?;
+    let _ = append_audit(
+        &app,
+        "write_text_file",
+        serde_json::json!({
+            "path": path,
+            "target": target.to_string_lossy(),
+            "bytes": content.len()
+        }),
+    );
+    Ok(serde_json::json!({
+        "ok": true,
+        "path": target.to_string_lossy(),
+        "bytesWritten": content.len(),
+    }))
+}
+
 #[tauri::command]
 pub fn list_directory(app: tauri::AppHandle, path: String) -> Result<Vec<DirEntryInfo>, String> {
-    let settings = load_settings(&app)?;
+    let settings = merged_settings_for_runtime(&app)?;
     let path = path.trim().to_string();
     if path.is_empty() {
         return Err("path is empty".into());
@@ -316,8 +672,7 @@ fn probe_python_version(exe: &str) -> Option<String> {
 
 #[tauri::command]
 pub fn get_environment(app: tauri::AppHandle) -> Result<EnvironmentInfo, String> {
-    let settings = load_settings(&app)?;
-    let ws = workspace_info_from_settings(&settings)?;
+    let ws = workspace_info_for_app(&app)?;
     let python3_version = probe_python_version("python3");
     let python_version = probe_python_version("python");
     Ok(EnvironmentInfo {

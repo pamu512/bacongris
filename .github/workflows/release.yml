@@ -1,0 +1,60 @@
+# Build macOS + Windows installers for testing. Does NOT create a public GitHub Release
+# (opt-in when you are ready to ship: restore `create-release` and `on.push.tags` below).
+name: Package (manual)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos:
+    name: macOS (universal .dmg)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - run: npm ci
+      - name: Build
+        run: npm run tauri build -- --target universal-apple-darwin
+      - name: List bundle output
+        run: find src-tauri/target -name "*.dmg" 2>/dev/null | head -20
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-macos
+          if-no-files-found: error
+          path: |
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+
+  build-windows:
+    name: Windows (NSIS setup .exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - name: Build
+        run: npm run tauri build
+      - name: List bundle output
+        shell: bash
+        run: find src-tauri/target -path "*bundle*nsis*" -name "*.exe" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-windows
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+
+  # When you want public one-click releases, add a job that uses softprops/action-gh-release
+  # and set `on.push.tags: [v*]`, and `permissions: contents: write` for the token.
