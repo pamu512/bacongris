@@ -1,11 +1,27 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { runAgenticTurn } from "./lib/agent/loop";
-import { CTI_SYSTEM_PROMPT } from "./lib/agent/systemPrompt";
-import type { AppSettings, OllamaMessage } from "./lib/agent/types";
+import {
+  runTaskVerifier,
+  type TaskVerifierResult,
+} from "./lib/agent/verifier";
+import { buildCtiSystemMessageContent } from "./lib/agent/systemPrompt";
+import type { AppSettings, ChatAttachment, OllamaMessage } from "./lib/agent/types";
+import {
+  filesToChatAttachments,
+  mergeUserMessageForModel,
+  systemHintForUserTurn,
+} from "./lib/chatAttachments";
 import type { WorkspaceInfo } from "./lib/workspace";
 import { IntegratedTerminal } from "./IntegratedTerminal";
+import {
+  summarizeAgentTurn,
+  toolCallsToSummaryLines,
+  toolResultForDisplay,
+  workspaceIndexProjectNames,
+  workspaceIndexStatus,
+} from "./lib/chatDisplay";
 import "./App.css";
 
 const defaultSettings = (): AppSettings => ({
@@ -50,6 +66,13 @@ function withStableIds(msgs: OllamaMessage[]): OllamaMessage[] {
   );
 }
 
+function isAnalyzeWorkspaceTool(m: OllamaMessage): boolean {
+  return (
+    m.tool_name === "analyze_workspace_run_requirements" ||
+    m.name === "analyze_workspace_run_requirements"
+  );
+}
+
 export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
@@ -59,6 +82,12 @@ export default function App() {
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [editDraft, setEditDraft] = useState("");
   const [input, setInput] = useState("");
+  const [pendingAttachments, setPendingAttachments] = useState<ChatAttachment[]>(
+    [],
+  );
+  const [attachmentReadBusy, setAttachmentReadBusy] = useState(false);
+  const [composerActiveDrop, setComposerActiveDrop] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [audit, setAudit] = useState<unknown[]>([]);
@@ -69,8 +98,23 @@ export default function App() {
   const [workspaceRunAnalysis, setWorkspaceRunAnalysis] = useState<string | null>(
     null,
   );
-  const [terminalOpen, setTerminalOpen] = useState(true);
+  /** Fast index JSON from the first user message of the chat; shown in Thinking + injected into system. */
+  const [sessionIndexJson, setSessionIndexJson] = useState<string | null>(null);
+  const [sessionIndexedForPath, setSessionIndexedForPath] = useState<string | null>(
+    null,
+  );
+  const [sessionIndexLoading, setSessionIndexLoading] = useState(false);
+  const [thinkingOpen, setThinkingOpen] = useState(false);
+  const [lastTurnThought, setLastTurnThought] = useState<ReturnType<
+    typeof summarizeAgentTurn
+  > | null>(null);
+  const [lastTurnVerification, setLastTurnVerification] =
+    useState<TaskVerifierResult | null>(null);
+  const [turnPanelKey, setTurnPanelKey] = useState(0);
+  /** Full terminal output vs slim bar; the dock is always in the layout. */
+  const [terminalExpanded, setTerminalExpanded] = useState(true);
   const endRef = useRef<HTMLDivElement | null>(null);
+  const lastWorkspacePathRef = useRef<string | undefined>(undefined);
 
   const loadAudit = useCallback(async () => {
     try {
@@ -119,12 +163,40 @@ export default function App() {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, busy]);
 
-  const systemMessage = useMemo<OllamaMessage>(() => {
-    const wsHint = workspace
-      ? `\n\n## Active workspace (use for all paths and run_command cwd)\n- workspaceRoot: ${workspace.effectivePath}\n- scriptsDir: ${workspace.scriptsPath}\n`
-      : "";
-    return { role: "system", content: CTI_SYSTEM_PROMPT + wsHint };
-  }, [workspace]);
+  useEffect(() => {
+    const current = workspace?.effectivePath;
+    if (
+      lastWorkspacePathRef.current !== undefined &&
+      current !== lastWorkspacePathRef.current
+    ) {
+      setSessionIndexJson(null);
+      setSessionIndexedForPath(null);
+    }
+    lastWorkspacePathRef.current = current;
+  }, [workspace?.effectivePath]);
+
+  const prepareSessionIndexForTurn = useCallback(
+    async (isFirstUserMessage: boolean): Promise<string | null> => {
+      if (!workspace) return null;
+      if (!isFirstUserMessage) {
+        return sessionIndexJson;
+      }
+      if (
+        sessionIndexJson &&
+        sessionIndexedForPath === workspace.effectivePath
+      ) {
+        return sessionIndexJson;
+      }
+      const report = await invoke<unknown>("analyze_workspace_run_requirements", {
+        use_cache: true,
+      });
+      const json = JSON.stringify(report, null, 2);
+      setSessionIndexJson(json);
+      setSessionIndexedForPath(workspace.effectivePath);
+      return json;
+    },
+    [workspace, sessionIndexJson, sessionIndexedForPath],
+  );
 
   const cancelMessageEdit = useCallback(() => {
     setEditingIndex(null);
@@ -145,12 +217,16 @@ export default function App() {
     const idx = editingIndex;
     if (idx === null || busy) return;
     const text = editDraft.trim();
-    if (!text) return;
+    const prev = messages[idx];
+    if (!prev || prev.role !== "user") return;
+    const keptAtt = prev.attachments;
+    if (!text && !keptAtt?.length) return;
 
     const prefix = messages.slice(0, idx);
     const userMsg: OllamaMessage = {
       role: "user",
       content: text,
+      ...(keptAtt?.length ? { attachments: keptAtt } : {}),
       localId: crypto.randomUUID(),
     };
 
@@ -158,14 +234,65 @@ export default function App() {
     cancelMessageEdit();
     setBusy(true);
     setStatus(null);
+    setLastTurnThought(null);
+    setLastTurnVerification(null);
+    const runStarted = performance.now();
 
     const withoutSystem = prefix.filter((m) => m.role !== "system");
-    const transcript: OllamaMessage[] = [systemMessage, ...withoutSystem, userMsg];
+    const isFirstUserMessage =
+      withoutSystem.filter((m) => m.role === "user").length === 0;
+    if (isFirstUserMessage && workspace) {
+      const needFetch =
+        !sessionIndexJson || sessionIndexedForPath !== workspace.effectivePath;
+      if (needFetch) setSessionIndexLoading(true);
+    }
+    let indexJson: string | null = null;
+    try {
+      indexJson = await prepareSessionIndexForTurn(isFirstUserMessage);
+    } finally {
+      setSessionIndexLoading(false);
+    }
+    const systemMsg: OllamaMessage = {
+      role: "system",
+      content: buildCtiSystemMessageContent(workspace, indexJson, {
+        lastUserMessage: systemHintForUserTurn(
+          text,
+          keptAtt?.length ? keptAtt : undefined,
+        ),
+      }),
+    };
+    const transcript: OllamaMessage[] = [systemMsg, ...withoutSystem, userMsg];
 
     const { transcript: full, error } = await runAgenticTurn(transcript);
     const forUi = withStableIds(full.filter((m) => m.role !== "system"));
     setMessages(forUi);
-    if (error) setStatus(error);
+    const newSlice = forUi.slice(withoutSystem.length + 1);
+    const thought = summarizeAgentTurn(newSlice, performance.now() - runStarted, {
+      loadedWorkspaceIndex: isFirstUserMessage && Boolean(indexJson),
+    });
+    setLastTurnThought(thought);
+    setTurnPanelKey((k) => k + 1);
+    if (error) {
+      setStatus(error);
+      setLastTurnVerification(null);
+    } else {
+      setStatus("Task check…");
+      try {
+        setLastTurnVerification(
+          await runTaskVerifier(
+            mergeUserMessageForModel(
+              text,
+              keptAtt?.length ? keptAtt : undefined,
+            ),
+            newSlice,
+          ),
+        );
+        setStatus(null);
+      } catch (e) {
+        setLastTurnVerification(null);
+        setStatus(e instanceof Error ? e.message : String(e));
+      }
+    }
     setBusy(false);
     await loadAudit();
     await refreshWorkspace();
@@ -174,7 +301,10 @@ export default function App() {
     editDraft,
     busy,
     messages,
-    systemMessage,
+    workspace,
+    sessionIndexJson,
+    sessionIndexedForPath,
+    prepareSessionIndexForTurn,
     cancelMessageEdit,
     loadAudit,
     refreshWorkspace,
@@ -201,7 +331,26 @@ export default function App() {
     }
   };
 
-  const pickWorkspaceFolder = async () => {
+  /**
+   * @param autoSave If true, persist settings immediately (e.g. from the Workspace sidebar).
+   *  If false, only update the draft — user must click "Save settings" (Settings drawer).
+   */
+  const addFilesFromList = useCallback(async (list: FileList | null) => {
+    if (list == null || list.length === 0) return;
+    setAttachmentReadBusy(true);
+    try {
+      const next = await filesToChatAttachments(list);
+      setPendingAttachments((prev) => [...prev, ...next]);
+    } finally {
+      setAttachmentReadBusy(false);
+    }
+  }, []);
+
+  const removePendingAttachment = useCallback((id: string) => {
+    setPendingAttachments((prev) => prev.filter((a) => a.id !== id));
+  }, []);
+
+  const pickWorkspaceFolder = async (autoSave = false) => {
     try {
       const choice = await open({
         directory: true,
@@ -215,8 +364,21 @@ export default function App() {
             ? choice[0]
             : null;
       if (path) {
-        setSettings((s) => ({ ...s, workspacePath: path }));
-        setStatus("Workspace path updated — click Save settings to apply.");
+        const next: AppSettings = {
+          ...settings,
+          workspacePath: path,
+          allowlistedRoots: textToLines(rootsText),
+          allowedExecutables: textToLines(execText),
+        };
+        if (autoSave) {
+          await persistSettings(next);
+          setStatus("Workspace folder saved.");
+          await loadAudit();
+          await refreshWorkspace();
+        } else {
+          setSettings(next);
+          setStatus("Workspace path updated — click Save settings to apply.");
+        }
       }
     } catch (e) {
       setStatus(e instanceof Error ? e.message : String(e));
@@ -225,28 +387,73 @@ export default function App() {
 
   const onSend = async () => {
     const text = input.trim();
-    if (!text || busy) return;
+    const atch = pendingAttachments;
+    if ((!text && !atch.length) || busy || attachmentReadBusy) return;
     setInput("");
+    setPendingAttachments([]);
     setBusy(true);
     setStatus(null);
+    setLastTurnThought(null);
+    setLastTurnVerification(null);
+    const runStarted = performance.now();
 
     const userMsg: OllamaMessage = {
       role: "user",
       content: text,
+      ...(atch.length ? { attachments: atch } : {}),
       localId: crypto.randomUUID(),
     };
     const withoutSystem = messages.filter((m) => m.role !== "system");
-    const transcript: OllamaMessage[] = [
-      systemMessage,
-      ...withoutSystem,
-      userMsg,
-    ];
     setMessages([...withoutSystem, userMsg]);
+
+    const isFirstUserMessage =
+      withoutSystem.filter((m) => m.role === "user").length === 0;
+    if (isFirstUserMessage && workspace) {
+      const needFetch =
+        !sessionIndexJson || sessionIndexedForPath !== workspace.effectivePath;
+      if (needFetch) setSessionIndexLoading(true);
+    }
+    let indexJson: string | null = null;
+    try {
+      indexJson = await prepareSessionIndexForTurn(isFirstUserMessage);
+    } finally {
+      setSessionIndexLoading(false);
+    }
+    const systemMsg: OllamaMessage = {
+      role: "system",
+      content: buildCtiSystemMessageContent(workspace, indexJson, {
+        lastUserMessage: systemHintForUserTurn(text, atch.length ? atch : undefined),
+      }),
+    };
+    const transcript: OllamaMessage[] = [systemMsg, ...withoutSystem, userMsg];
 
     const { transcript: full, error } = await runAgenticTurn(transcript);
     const forUi = withStableIds(full.filter((m) => m.role !== "system"));
     setMessages(forUi);
-    if (error) setStatus(error);
+    const newSlice = forUi.slice(withoutSystem.length + 1);
+    const thought = summarizeAgentTurn(newSlice, performance.now() - runStarted, {
+      loadedWorkspaceIndex: isFirstUserMessage && Boolean(indexJson),
+    });
+    setLastTurnThought(thought);
+    setTurnPanelKey((k) => k + 1);
+    if (error) {
+      setStatus(error);
+      setLastTurnVerification(null);
+    } else {
+      setStatus("Task check…");
+      try {
+        setLastTurnVerification(
+          await runTaskVerifier(
+            mergeUserMessageForModel(text, atch.length ? atch : undefined),
+            newSlice,
+          ),
+        );
+        setStatus(null);
+      } catch (e) {
+        setLastTurnVerification(null);
+        setStatus(e instanceof Error ? e.message : String(e));
+      }
+    }
     setBusy(false);
     await loadAudit();
     await refreshWorkspace();
@@ -254,9 +461,21 @@ export default function App() {
 
   const onClearChat = () => {
     cancelMessageEdit();
+    setPendingAttachments([]);
     setMessages([]);
     setStatus(null);
+    setSessionIndexJson(null);
+    setSessionIndexedForPath(null);
+    setSessionIndexLoading(false);
+    setLastTurnThought(null);
+    setLastTurnVerification(null);
   };
+
+  const thinkingStatusText = workspaceIndexStatus(
+    sessionIndexJson,
+    sessionIndexLoading,
+  );
+  const indexProjectNames = workspaceIndexProjectNames(sessionIndexJson);
 
   return (
     <div className="app">
@@ -282,11 +501,15 @@ export default function App() {
           </button>
           <button
             type="button"
-            className={`btn ghost${terminalOpen ? " active-toggle" : ""}`}
-            onClick={() => setTerminalOpen((v) => !v)}
-            title="Show or hide the integrated terminal"
+            className={`btn ghost${terminalExpanded ? " active-toggle" : ""}`}
+            onClick={() => setTerminalExpanded((v) => !v)}
+            title={
+              terminalExpanded
+                ? "Collapse terminal output (bar stays visible)"
+                : "Expand terminal output"
+            }
           >
-            Terminal
+            {terminalExpanded ? "Collapse terminal" : "Expand terminal"}
           </button>
         </div>
       </header>
@@ -298,6 +521,29 @@ export default function App() {
             {workspace
               ? workspace.effectivePath
               : "…"}
+          </p>
+          <div className="workspace-path-row">
+            <button
+              type="button"
+              className="btn small primary"
+              onClick={() => void pickWorkspaceFolder(true)}
+            >
+              Change workspace folder…
+            </button>
+            <button
+              type="button"
+              className="btn small ghost"
+              onClick={() => {
+                setSettingsOpen(true);
+              }}
+            >
+              Open Settings
+            </button>
+          </div>
+          <p className="workspace-hint minimal">
+            The path above is not editable as text here — use{" "}
+            <strong>Change workspace folder</strong> (saves immediately) or{" "}
+            <strong>Settings</strong> → type or <em>Choose folder</em> → <em>Save settings</em>.
           </p>
             <p className="workspace-hint">
             Scripts live in <code>scripts/</code> inside this folder (allowlisted for tools). On
@@ -380,7 +626,105 @@ export default function App() {
         </aside>
 
         <div className="content-column">
+        <div className="main-chat-stack">
         <main className="main">
+        {(lastTurnThought || lastTurnVerification) && (
+          <section
+            key={turnPanelKey}
+            className="turn-meta"
+            aria-label="Last model run and task check"
+          >
+            {lastTurnThought && (
+              <div className="turn-thought">
+                <div className="turn-thought-kicker">
+                  Thought for {lastTurnThought.durationLabel}s
+                </div>
+                <p className="turn-thought-lead">{lastTurnThought.headline}</p>
+                <details className="turn-thought-details">
+                  <summary className="turn-thought-summary">
+                    {lastTurnThought.subline}
+                  </summary>
+                  {lastTurnThought.detailLines.length > 0 && (
+                    <ul className="turn-thought-bullets">
+                      {lastTurnThought.detailLines.map((line, i) => (
+                        <li key={i}>{line}</li>
+                      ))}
+                    </ul>
+                  )}
+                </details>
+              </div>
+            )}
+            {lastTurnVerification && (
+              <div
+                className={`task-verifier task-verifier--${lastTurnVerification.verdict}`}
+                aria-label="Task verifier"
+              >
+                <div className="task-verifier-kicker">Second-opinion task check</div>
+                <p className="task-verifier-verdict">
+                  <span className="task-verifier-badge">{lastTurnVerification.verdict}</span>
+                  <span className="task-verifier-conf">
+                    confidence {(lastTurnVerification.confidence * 100).toFixed(0)}%
+                  </span>
+                </p>
+                <p className="task-verifier-summary">{lastTurnVerification.summary}</p>
+                {lastTurnVerification.gaps.length > 0 && (
+                  <ul className="task-verifier-gaps">
+                    {lastTurnVerification.gaps.map((g, i) => (
+                      <li key={i}>{g}</li>
+                    ))}
+                  </ul>
+                )}
+                {lastTurnVerification.parseWarning && (
+                  <p className="task-verifier-warn">Verifier parse: {lastTurnVerification.parseWarning}</p>
+                )}
+              </div>
+            )}
+          </section>
+        )}
+        <section
+          className="thinking-panel"
+          aria-label="Session workspace index for inspection"
+        >
+          <button
+            type="button"
+            className="thinking-toggle"
+            onClick={() => setThinkingOpen((o) => !o)}
+            aria-expanded={thinkingOpen}
+          >
+            <span className="thinking-toggle-label">Workspace index</span>
+            <span className="thinking-toggle-sub">{thinkingStatusText}</span>
+          </button>
+          {thinkingOpen && (
+            <div className="thinking-body">
+              {sessionIndexLoading && !sessionIndexJson && (
+                <p className="thinking-placeholder">Building workspace index…</p>
+              )}
+              {sessionIndexJson && (
+                <>
+                  {indexProjectNames.length > 0 && (
+                    <ul className="thinking-project-list">
+                      {indexProjectNames.map((name) => (
+                        <li key={name}>
+                          <code>{name}</code>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  <details className="thinking-full-json">
+                    <summary>Full index JSON (for the model)</summary>
+                    <pre className="thinking-pre">{sessionIndexJson}</pre>
+                  </details>
+                </>
+              )}
+              {!sessionIndexLoading && !sessionIndexJson && (
+                <p className="thinking-placeholder muted">
+                  The first message in this chat runs a fast project index and injects it for the
+                  model. Clear chat to reset.
+                </p>
+              )}
+            </div>
+          )}
+        </section>
         <section className="chat">
           {messages.length === 0 && (
             <div className="empty">
@@ -395,9 +739,13 @@ export default function App() {
                 llama3.1).
               </p>
               <p className="hint">
+                Use <strong>Attach files</strong> or drag files onto the composer
+                to send text/CSV/JSON with your message (UTF-8; size limits apply).
+              </p>
+              <p className="hint">
                 Sent <strong>user</strong> messages can be edited from the{" "}
                 <strong>Edit</strong> link — the thread below that point is
-                discarded and the agent runs again (like Cursor).
+                discarded and the agent runs again.
               </p>
             </div>
           )}
@@ -425,6 +773,12 @@ export default function App() {
                 )}
                 {m.role === "user" && editingIndex === i ? (
                   <div className="msg-edit">
+                    {m.attachments && m.attachments.length > 0 && (
+                      <p className="msg-edit-attach-note">
+                        This turn includes <strong>{m.attachments.length}</strong> attached
+                        file(s); only the text below is edited — same files are re-sent.
+                      </p>
+                    )}
                     <textarea
                       className="msg-edit-input"
                       rows={4}
@@ -461,13 +815,109 @@ export default function App() {
                   </div>
                 ) : (
                   <>
-                    {m.content != null && m.content !== "" && (
-                      <pre className="msg-body">{m.content}</pre>
-                    )}
-                    {m.tool_calls && m.tool_calls.length > 0 && (
-                      <pre className="msg-tools">
-                        {JSON.stringify(m.tool_calls, null, 2)}
-                      </pre>
+                    {m.role === "tool" &&
+                    isAnalyzeWorkspaceTool(m) &&
+                    sessionIndexJson &&
+                    (m.content?.length ?? 0) > 4000 ? (
+                      <>
+                        <p className="msg-tool-note">
+                          Large <code>analyze_workspace_run_requirements</code> output — see{" "}
+                          <strong>Workspace index</strong> above.
+                        </p>
+                        <details className="msg-tool-details">
+                          <summary>Raw tool output</summary>
+                          <pre className="msg-body">{m.content}</pre>
+                        </details>
+                      </>
+                    ) : m.role === "tool" ? (
+                      <div className="msg-tool-compact">
+                        <div className="msg-tool-meta">
+                          {m.tool_name ?? m.name ?? "tool"}
+                        </div>
+                        {(() => {
+                          const r = toolResultForDisplay(m.content);
+                          return (
+                            <>
+                              <p
+                                className={
+                                  r.isError ? "msg-tool-err" : "msg-tool-ok"
+                                }
+                              >
+                                {r.headline}
+                              </p>
+                              <details className="msg-tool-details">
+                                <summary>Full output</summary>
+                                <pre className="msg-body msg-body-raw">
+                                  {r.raw}
+                                </pre>
+                              </details>
+                            </>
+                          );
+                        })()}
+                      </div>
+                    ) : m.role === "user" ? (
+                      <>
+                        {m.content != null && m.content.trim() !== "" && (
+                          <pre className="msg-body">{m.content}</pre>
+                        )}
+                        {m.attachments && m.attachments.length > 0 && (
+                          <ul
+                            className="msg-attach-list"
+                            aria-label="Files attached to this message"
+                          >
+                            {m.attachments.map((a) => (
+                              <li key={a.id} className="msg-attach-chip">
+                                <span className="msg-attach-name">{a.name}</span>
+                                <span className="msg-attach-meta">
+                                  {a.omittedReason
+                                    ? a.omittedReason === "too_large"
+                                      ? " — not inlined (too large)"
+                                      : a.omittedReason === "binary"
+                                        ? " — not inlined (binary)"
+                                        : " — empty"
+                                    : ` — ${(a.sizeBytes / 1024).toFixed(
+                                        a.sizeBytes < 10_240 ? 1 : 0,
+                                      )} KB in model context`}
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        {m.content != null && m.content.trim() !== "" && (
+                          <pre className="msg-body">{m.content}</pre>
+                        )}
+                        {m.tool_calls && m.tool_calls.length > 0 && (
+                          <div className="msg-tool-calls">
+                            <div className="msg-tool-calls-h">Tool calls</div>
+                            <ul className="msg-tool-calls-ul">
+                              {toolCallsToSummaryLines(m.tool_calls).map(
+                                (t, j) => (
+                                  <li key={j}>
+                                    <code className="msg-tool-call-line">
+                                      {t.line}
+                                    </code>
+                                  </li>
+                                ),
+                              )}
+                            </ul>
+                            <details className="msg-raw-tool-json">
+                              <summary>Raw JSON</summary>
+                              <pre className="msg-tools">
+                                {JSON.stringify(m.tool_calls, null, 2)}
+                              </pre>
+                            </details>
+                          </div>
+                        )}
+                        {m.role === "assistant" && m.thinking && m.thinking.trim() !== "" && (
+                          <details className="msg-model-reasoning">
+                            <summary>Model chain-of-thought (optional)</summary>
+                            <pre className="msg-body msg-body-cot">{m.thinking}</pre>
+                          </details>
+                        )}
+                      </>
                     )}
                   </>
                 )}
@@ -483,15 +933,54 @@ export default function App() {
           </ul>
         </section>
 
-        <footer className="composer">
+        <footer
+          className={`composer${composerActiveDrop ? " composer--drop" : ""}`}
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (!busy) setComposerActiveDrop(true);
+          }}
+          onDragLeave={(e) => {
+            e.preventDefault();
+            if (e.currentTarget === e.target) setComposerActiveDrop(false);
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setComposerActiveDrop(false);
+            if (busy || attachmentReadBusy) return;
+            const fl = e.dataTransfer?.files;
+            if (fl?.length) void addFilesFromList(fl);
+          }}
+        >
           {status && <div className="status">{status}</div>}
+          {pendingAttachments.length > 0 && (
+            <ul className="composer-attach-pending" aria-label="Files to send with next message">
+              {pendingAttachments.map((a) => (
+                <li key={a.id} className="composer-attach-chip">
+                  <span className="msg-attach-name">{a.name}</span>
+                  {a.omittedReason ? (
+                    <span className="msg-attach-warn"> ({a.omittedReason})</span>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="btn link composer-attach-remove"
+                    onClick={() => removePendingAttachment(a.id)}
+                    aria-label={`Remove ${a.name}`}
+                  >
+                    Remove
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
           <div className="composer-row">
             <textarea
               className="input"
               rows={3}
-              placeholder="Message the agent…"
+              placeholder="Message the agent… (you can attach files below)"
               value={input}
-              disabled={busy}
+              disabled={busy || attachmentReadBusy}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
@@ -500,21 +989,59 @@ export default function App() {
                 }
               }}
             />
-            <button
-              type="button"
-              className="btn primary"
-              disabled={busy}
-              onClick={() => void onSend()}
-            >
-              Send
-            </button>
+            <div className="composer-actions">
+              <input
+                ref={fileInputRef}
+                type="file"
+                className="visually-hidden"
+                multiple
+                aria-hidden
+                tabIndex={-1}
+                onChange={(e) => {
+                  void addFilesFromList(e.target.files);
+                  e.target.value = "";
+                }}
+              />
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={busy || attachmentReadBusy}
+                title="Attach text / log / CSV (UTF-8). Large or binary files are listed but not inlined."
+                onClick={() => fileInputRef.current?.click()}
+              >
+                {attachmentReadBusy ? "Reading…" : "Attach files"}
+              </button>
+              <button
+                type="button"
+                className="btn primary"
+                disabled={busy || attachmentReadBusy}
+                onClick={() => void onSend()}
+              >
+                Send
+              </button>
+            </div>
           </div>
+          <p className="composer-hint" role="note">
+            <strong>Attach</strong> adds files to the next message (text, CSV, JSON, logs; max ~256
+            KB per file, UTF-8; drag-and-drop here). Bigger or binary files appear as a note for the
+            model — use the workspace and <code>read_text_file</code> when needed. For IntelX / CVE
+            the agent may use <code>run_trusted_workflow</code>. The model does not read the
+            terminal stream—paste output if it should see it.
+          </p>
         </footer>
       </main>
+        </div>
+        <div
+          className={`terminal-split${terminalExpanded ? "" : " terminal-split--collapsed"}`}
+          aria-label="Terminal column"
+        >
         <IntegratedTerminal
-          visible={terminalOpen}
+          visible
+          expanded={terminalExpanded}
+          onToggleExpand={() => setTerminalExpanded((e) => !e)}
           cwd={workspace?.effectivePath ?? null}
         />
+        </div>
         </div>
       </div>
 

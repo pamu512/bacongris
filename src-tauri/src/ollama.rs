@@ -16,6 +16,16 @@ pub async fn chat_with_settings(
     messages: Value,
     tools: Option<Value>,
 ) -> Result<Value, String> {
+    chat_with_settings_ex(settings, messages, tools, false).await
+}
+
+/// `json_response`: set Ollama `format: "json"` so the model must emit valid JSON (used by task verifier).
+async fn chat_with_settings_ex(
+    settings: &AppSettings,
+    messages: Value,
+    tools: Option<Value>,
+    json_response: bool,
+) -> Result<Value, String> {
     let base = settings.ollama_base_url.trim_end_matches('/');
     let url = format!("{base}/api/chat");
 
@@ -24,6 +34,9 @@ pub async fn chat_with_settings(
         "messages": messages,
         "stream": false,
     });
+    if json_response {
+        body["format"] = serde_json::json!("json");
+    }
     if let Some(t) = tools {
         body["tools"] = t;
     }
@@ -46,7 +59,53 @@ pub async fn chat_with_settings(
         return Err(format!("Ollama HTTP {}: {}", status, txt));
     }
 
-    res.json()
+    let v: Value = res
+        .json()
         .await
-        .map_err(|e| format!("invalid JSON from Ollama: {e}"))
+        .map_err(|e| format!("invalid JSON from Ollama: {e}"))?;
+
+    ollama_debug_log_response(&v);
+
+    Ok(v)
+}
+
+/// Text-only chat (no tool definitions) with `format: "json"` for structured verifier output.
+#[tauri::command]
+pub async fn ollama_verifier_chat(
+    app: tauri::AppHandle,
+    messages: Value,
+) -> Result<Value, String> {
+    let settings = load_settings(&app)?;
+    chat_with_settings_ex(&settings, messages, None, true).await
+}
+
+/// Dev-side trace (see stderr when running `cargo tauri dev` / app from a terminal). No full bodies.
+fn ollama_debug_log_response(v: &Value) {
+    let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("?");
+    let done = v.get("done").and_then(|d| d.as_bool());
+    let top_keys: Vec<String> = v
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    eprintln!("[bacongris:ollama] model={model} done={done:?} top_level_keys={top_keys:?}");
+    if let Some(msg) = v.get("message").and_then(|m| m.as_object()) {
+        let keys: Vec<String> = msg.keys().cloned().collect();
+        let content_len = msg
+            .get("content")
+            .and_then(|c| c.as_str())
+            .map(|s| s.len());
+        let thinking_len = msg
+            .get("thinking")
+            .and_then(|c| c.as_str())
+            .map(|s| s.len());
+        let tc = msg
+            .get("tool_calls")
+            .and_then(|t| t.as_array())
+            .map(|a| a.len());
+        eprintln!(
+            "[bacongris:ollama] message keys={keys:?} content_len={content_len:?} thinking_len={thinking_len:?} tool_calls={tc:?}"
+        );
+    } else {
+        eprintln!("[bacongris:ollama] missing or non-object `message`");
+    }
 }

@@ -230,6 +230,13 @@ pub fn terminal_ensure_write(app: AppHandle, data: String, cwd: Option<String>) 
     if data.is_empty() {
         return Err("empty data".into());
     }
+    let preview: String = data.chars().take(120).collect();
+    let preview_esc = preview.replace('\n', "\\n");
+    eprintln!(
+        "[bacongris:pty] terminal_ensure_write bytes={} cwd={:?} preview={preview_esc:?}",
+        data.len(),
+        cwd.as_deref()
+    );
     let state: tauri::State<'_, TerminalState> = app.state();
     {
         let mut inner = state.0.lock().map_err(|e| e.to_string())?;

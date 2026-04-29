@@ -82,6 +82,36 @@ pub fn resolve_under_roots(path: &Path, settings: &AppSettings) -> Result<PathBu
     ))
 }
 
+/// Like [`resolve_path_for_filesystem_tools`] but does not require the target to exist. Used for
+/// clearer `read_text_file` errors (e.g. "parent directory exists, file does not").
+pub fn join_workspace_path_for_display(
+    path: &Path,
+    settings: &AppSettings,
+) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        let ws = crate::settings::resolve_workspace_dir(settings)?;
+        Ok(ws.join(path))
+    }
+}
+
+/// For `read_text_file` / `list_directory`: relative paths (e.g. `CVE_Project_NVD/README.md`) are
+/// resolved under the configured **workspace** root, then checked with [`resolve_under_roots`].
+/// Absolute paths are unchanged. This matches how the index names project folders.
+pub fn resolve_path_for_filesystem_tools(
+    path: &Path,
+    settings: &AppSettings,
+) -> Result<PathBuf, String> {
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let ws = crate::settings::resolve_workspace_dir(settings)?;
+        ws.join(path)
+    };
+    resolve_under_roots(&full, settings)
+}
+
 fn is_bare_executable_name(s: &str) -> bool {
     !s.is_empty() && !s.contains('/') && !s.contains('\\')
 }

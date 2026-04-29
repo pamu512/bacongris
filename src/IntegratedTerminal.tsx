@@ -27,8 +27,12 @@ function sanitizeMarkdownFencedPaste(text: string): string {
 }
 
 type Props = {
+  /** If false, the xterm is unmounted (PTY disposed). Prefer **expanded** to keep the dock visible. */
   visible: boolean;
   cwd: string | null;
+  /** When false, the terminal shell output is hidden but the dock bar stays visible; PTY stays attached. */
+  expanded: boolean;
+  onToggleExpand: () => void;
 };
 
 /** Attach to an existing backend PTY (e.g. started by the agent) or start a new shell. Never kills a live session. */
@@ -47,7 +51,7 @@ async function attachOrSpawnSession(
   await invoke("terminal_spawn", { cwd: c, cols, rows });
 }
 
-export function IntegratedTerminal({ visible, cwd }: Props) {
+export function IntegratedTerminal({ visible, expanded, onToggleExpand, cwd }: Props) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -186,10 +190,29 @@ export function IntegratedTerminal({ visible, cwd }: Props) {
     };
   }, [visible, cwd]);
 
+  useEffect(() => {
+    if (!visible || !expanded) return;
+    const t = termRef.current;
+    const f = fitRef.current;
+    if (!t || !f) return;
+    const id = requestAnimationFrame(() => {
+      try {
+        f.fit();
+        void invoke("terminal_resize", { cols: t.cols, rows: t.rows }).catch(() => {});
+      } catch {
+        /* ignore */
+      }
+    });
+    return () => cancelAnimationFrame(id);
+  }, [visible, expanded]);
+
   if (!visible) return null;
 
   return (
-    <div className="terminal-dock" aria-label="Integrated terminal">
+    <div
+      className={`terminal-dock${expanded ? "" : " terminal-dock--collapsed"}`}
+      aria-label="Integrated terminal"
+    >
       <div className="terminal-toolbar">
         <span className="terminal-title">Terminal</span>
         <span
@@ -203,6 +226,15 @@ export function IntegratedTerminal({ visible, cwd }: Props) {
           {cwd ? cwd : "cwd: (loading workspace…)"}
         </span>
         <div className="terminal-actions">
+          <button
+            type="button"
+            className="btn small ghost"
+            onClick={onToggleExpand}
+            title={expanded ? "Collapse terminal (keep bar visible)" : "Expand terminal"}
+            aria-expanded={expanded}
+          >
+            {expanded ? "▼ Collapse" : "▲ Expand"}
+          </button>
           <button
             type="button"
             className="btn small ghost"
@@ -222,7 +254,11 @@ export function IntegratedTerminal({ visible, cwd }: Props) {
           </button>
         </div>
       </div>
-      <div className="terminal-xterm-wrap" ref={wrapRef} />
+      <div
+        className={`terminal-xterm-wrap${expanded ? "" : " terminal-xterm-wrap--hidden"}`}
+        ref={wrapRef}
+        aria-hidden={!expanded}
+      />
     </div>
   );
 }

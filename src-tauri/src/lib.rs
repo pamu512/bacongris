@@ -5,13 +5,15 @@ mod ollama;
 mod paths;
 mod pty_terminal;
 mod settings;
+mod workflow_runner;
 mod workspace;
 mod workspace_analyze;
 
 use audit::{clear_audit_log, get_recent_audit};
 use executor::{get_environment, list_directory, read_text_file, run_command};
-use ollama::ollama_chat;
+use ollama::{ollama_chat, ollama_verifier_chat};
 use settings::{load_settings, save_settings, settings_path, AppSettings};
+use workflow_runner::run_trusted_workflow;
 use workspace::{get_workspace_info, open_workspace_in_os, prepare_workspace_layout};
 use workspace_analyze::analyze_workspace_run_requirements;
 use pty_terminal::{
@@ -44,6 +46,7 @@ pub fn run() {
             save_settings_cmd,
             settings_file_path,
             ollama_chat,
+            ollama_verifier_chat,
             run_command,
             read_text_file,
             list_directory,
@@ -54,6 +57,7 @@ pub fn run() {
             prepare_workspace_layout,
             open_workspace_in_os,
             analyze_workspace_run_requirements,
+            run_trusted_workflow,
             terminal_spawn,
             terminal_write,
             terminal_ensure_write,

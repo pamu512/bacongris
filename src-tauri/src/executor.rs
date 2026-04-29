@@ -1,7 +1,7 @@
 use crate::audit::append_audit;
 use crate::gui_spawn_env::{clear_stale_docker_host, merged_path};
-use crate::paths::{resolve_program_path, resolve_under_roots};
-use crate::settings::load_settings;
+use crate::paths::{join_workspace_path_for_display, resolve_path_for_filesystem_tools, resolve_program_path};
+use crate::settings::{load_settings, AppSettings};
 use crate::workspace::workspace_info_from_settings;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -82,6 +82,34 @@ fn lossy_string(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// If path resolution failed, add context so the model lists dirs instead of guessing shell paths.
+fn augment_read_text_file_error(user_path: &str, inner: String, settings: &AppSettings) -> String {
+    let p = Path::new(user_path);
+    let lower = user_path.to_lowercase();
+
+    if let Ok(target) = join_workspace_path_for_display(p, settings) {
+        if let Some(parent) = target.parent() {
+            if parent.is_dir() {
+                return format!(
+                    "{inner}\n\n**Parent directory exists** (file missing or wrong final path): `{}`\nCall **list_directory** on that path, and for IntelX output also list each **subfolder** of `Intelx_Crawler/csv_output/` if needed. Then **read_text_file** using the **exact** `name` from the listing. **Do not** use **send_integrated_terminal** to `ls` or `cat` a **retyped** long filename—shell **stdout is not in chat**; a single character typo in the address (e.g. `gmail` → `gmai`) breaks the path.",
+                    parent.display()
+                );
+            }
+        }
+    }
+
+    if lower.contains("intelx_crawler")
+        && lower.contains("csv")
+        && (lower.ends_with(".csv") || lower.contains("csv_output"))
+    {
+        return format!(
+            "{inner}\n\n**IntelX layout:** CSVs are often one level down, e.g. `Intelx_Crawler/csv_output/<run-specific-folder>/...csv`, not only `.../csv_output/<filename>.csv`. **list_directory** `Intelx_Crawler/csv_output`, then subfolders, until the file appears. Copy the filename from the tool; do not guess in the integrated terminal."
+        );
+    }
+
+    inner
+}
+
 #[tauri::command]
 pub async fn run_command(
     app: tauri::AppHandle,
@@ -108,7 +136,7 @@ pub async fn run_command(
                 return Err("cwd is empty when set".into());
             }
             let p = Path::new(c);
-            resolve_under_roots(p, &settings)?
+            resolve_path_for_filesystem_tools(p, &settings)?
         }
     };
 
@@ -196,7 +224,10 @@ pub fn read_text_file(app: tauri::AppHandle, path: String) -> Result<String, Str
         return Err("path is empty".into());
     }
     let p = Path::new(&path);
-    let canon = resolve_under_roots(p, &settings)?;
+    let canon = match resolve_path_for_filesystem_tools(p, &settings) {
+        Ok(c) => c,
+        Err(e) => return Err(augment_read_text_file_error(&path, e, &settings)),
+    };
     let meta = std::fs::metadata(&canon).map_err(|e| format!("metadata: {e}"))?;
     if !meta.is_file() {
         return Err("not a file".into());
@@ -211,7 +242,7 @@ pub fn read_text_file(app: tauri::AppHandle, path: String) -> Result<String, Str
     let _ = append_audit(
         &app,
         "read_text_file",
-        serde_json::json!({ "path": path, "bytes": bytes.len() }),
+        serde_json::json!({ "path": path, "resolved": canon.display().to_string(), "bytes": bytes.len() }),
     );
     String::from_utf8(bytes).map_err(|e| format!("file is not valid UTF-8: {e}"))
 }
@@ -224,7 +255,7 @@ pub fn list_directory(app: tauri::AppHandle, path: String) -> Result<Vec<DirEntr
         return Err("path is empty".into());
     }
     let p = Path::new(&path);
-    let canon = resolve_under_roots(p, &settings)?;
+    let canon = resolve_path_for_filesystem_tools(p, &settings)?;
     let read = std::fs::read_dir(&canon).map_err(|e| format!("read_dir: {e}"))?;
     let mut out = Vec::new();
     for ent in read {
@@ -259,12 +290,36 @@ pub struct EnvironmentInfo {
     pub workspace_root: String,
     pub scripts_dir: String,
     pub workspace_is_custom: bool,
+    /// `python3 --version` stdout/stderr when on PATH; `None` if not found.
+    pub python3_version: Option<String>,
+    /// `python --version` when on PATH and distinct from the python3 probe; `None` if not found.
+    pub python_version: Option<String>,
+}
+
+fn probe_python_version(exe: &str) -> Option<String> {
+    let output = std::process::Command::new(exe)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let line = if !out.is_empty() { out } else { err };
+    if line.is_empty() {
+        None
+    } else {
+        Some(line)
+    }
 }
 
 #[tauri::command]
 pub fn get_environment(app: tauri::AppHandle) -> Result<EnvironmentInfo, String> {
     let settings = load_settings(&app)?;
     let ws = workspace_info_from_settings(&settings)?;
+    let python3_version = probe_python_version("python3");
+    let python_version = probe_python_version("python");
     Ok(EnvironmentInfo {
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
@@ -277,5 +332,7 @@ pub fn get_environment(app: tauri::AppHandle) -> Result<EnvironmentInfo, String>
         workspace_root: ws.effective_path,
         scripts_dir: ws.scripts_path,
         workspace_is_custom: ws.is_custom_location,
+        python3_version,
+        python_version,
     })
 }
