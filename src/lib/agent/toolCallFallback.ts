@@ -1,5 +1,6 @@
 import type { OllamaToolCall } from "./types";
 import { getOllamaTools } from "./tools";
+import { VISUAL_WORKSPACE_MAP } from "../visualWorkspaceMap";
 
 let allowedNames: Set<string> | null = null;
 
@@ -15,6 +16,93 @@ function getAllowedToolNames(): Set<string> {
       .map((t) => t.function!.name as string),
   );
   return allowedNames;
+}
+
+/**
+ * Some models prefix tools (`tool.get_environment`), use JSON-RPC `method`, or send channel noise
+ * (`assistant<|channel|>…`). Map to a real Ollama tool name when possible.
+ */
+function pascalOrMixedToSnake(s: string): string {
+  if (!s) return s;
+  return s
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .toLowerCase();
+}
+
+/** Common wrong names from local models → real `function.name`. */
+const TOOL_NAME_ALIASES: Record<string, string> = {
+  analysis_workspace_run_requirements: "analyze_workspace_run_requirements",
+  analyse_workspace_run_requirements: "analyze_workspace_run_requirements",
+  analysis_workspace_run_requirement: "analyze_workspace_run_requirements",
+};
+
+export function canonicalizeHallucinatedToolName(
+  name: string,
+  args: Record<string, unknown>,
+): string {
+  const allowed = getAllowedToolNames();
+  if (allowed.has(name)) return name;
+
+  const m = args["method"];
+  if (typeof m === "string" && allowed.has(m.trim())) {
+    return m.trim();
+  }
+  const fromName = pickStringField(args, ["name", "toolName", "tool"]);
+  if (
+    fromName &&
+    allowed.has(fromName) &&
+    (name === "assistant" || /^assistant/i.test(name))
+  ) {
+    return fromName;
+  }
+
+  let n = name.trim();
+
+  // `tool:analyze_*`, `TOOL:LIST_DIRECTORY`, `function.read_text_file`, etc.
+  for (let i = 0; i < 6; i++) {
+    const next = n.replace(/^(?:tool|function|mcp|functions)[:._-]+/i, "").trim();
+    if (next === n) break;
+    n = next;
+  }
+
+  // `assistant<|channel|>list_directory`, `assistant:`, role noise
+  n = n.replace(/^assistant\s*:\s*/i, "").trim();
+  n = n.replace(/^assistant\s*/i, "").trim();
+  while (/^<\|[^|]+\|\>/.test(n)) {
+    n = n.replace(/^<\|[^|]+\|\>\s*/i, "").trim();
+  }
+
+  const aliased = TOOL_NAME_ALIASES[n] ?? TOOL_NAME_ALIASES[n.toLowerCase()];
+  if (aliased && allowed.has(aliased)) return aliased;
+
+  // Model sent only a role label; infer from args when obvious.
+  if (!n || /^:+$/.test(n)) {
+    const p = pickStringField(args, ["path", "Path", "file", "filepath", "filePath"]);
+    if (p && allowed.has("list_directory")) return "list_directory";
+    const inp = pickStringField(args, ["input", "workflow", "workflow_relative_path"]);
+    if (inp && allowed.has("analyze_workspace_run_requirements")) {
+      return "analyze_workspace_run_requirements";
+    }
+  }
+
+  n = n.replace(/^(?:tool|function|mcp|functions)\.+/i, "");
+  n = n.replace(/^(?:tool|function|mcp|functions)_+/i, "");
+  if (allowed.has(n)) return n;
+  if (n.includes(".")) {
+    const last = n.split(".").pop() || n;
+    const snake = pascalOrMixedToSnake(last);
+    if (allowed.has(snake)) return snake;
+  }
+  const snake = pascalOrMixedToSnake(n);
+  if (allowed.has(snake)) return snake;
+  for (const a of allowed) {
+    if (a.toLowerCase() === n.toLowerCase()) return a;
+  }
+  for (const a of allowed) {
+    if (a.toLowerCase() === snake.toLowerCase()) return a;
+  }
+  return name;
 }
 
 function stripCodeFences(s: string): string {
@@ -116,7 +204,7 @@ function tryActionParamsToolCalls(parsed: unknown): OllamaToolCall[] | null {
   const o = parsed as Record<string, unknown>;
   const action = o.action;
   if (typeof action !== "string" || !action.trim()) return null;
-  const name = action.trim();
+  const name = canonicalizeHallucinatedToolName(action.trim(), o);
   const allowed = getAllowedToolNames();
   if (!allowed.has(name)) return null;
   const params = o.params ?? o.arguments;
@@ -331,7 +419,7 @@ function hallucinatedRunToSendTerminal(
   if (!/^\s*cd\s/i.test(line) && needsCveDir) {
     const firstToken = line.split(/\s+/)[0] ?? "";
     if (!firstToken.includes("/") && firstToken !== "cd") {
-      line = `cd CVE_Project_NVD && ${line}`;
+      line = `cd ${VISUAL_WORKSPACE_MAP.VULNS_CVE} && ${line}`;
     }
   }
 
@@ -416,6 +504,28 @@ function makeToCall(allowed: Set<string>) {
       else if (r["arguments"] !== undefined) args = r["arguments"];
     }
     if (!name) return null;
+    {
+      const merged: Record<string, unknown> = {
+        ...r,
+        ...(args && typeof args === "object" && !Array.isArray(args)
+          ? (args as Record<string, unknown>)
+          : {}),
+      };
+      const fixed = canonicalizeHallucinatedToolName(name, merged);
+      if (fixed !== name) {
+        name = fixed;
+      }
+    }
+    // Some models say "enrich" instead of enrich_ioc; map when args look like IOC enrichment.
+    if (name.toLowerCase() === "enrich" && allowed.has("enrich_ioc")) {
+      const rec =
+        args && typeof args === "object" && !Array.isArray(args)
+          ? (args as Record<string, unknown>)
+          : null;
+      if (rec && typeof rec.ioc === "string" && rec.ioc.trim() !== "") {
+        name = "enrich_ioc";
+      }
+    }
     if (!allowed.has(name)) {
       if (HALLUCINATED_RUN_NAMES.has(name.toLowerCase())) {
         const syn = hallucinatedRunToSendTerminal(args, r);

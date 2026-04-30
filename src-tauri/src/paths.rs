@@ -207,6 +207,9 @@ pub fn lookup_bare_in_path(name: &str) -> Option<PathBuf> {
 /// has not listed it under Allowed executables — avoids requiring `which docker` for common setups.
 fn well_known_executable_paths(requested: &str) -> &'static [&'static str] {
     match requested.to_lowercase().as_str() {
+        // Used by maintenance jobs and `bash -c` tool flows; must resolve without a Settings line.
+        "bash" => &["/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/bin/bash", "/usr/bin/bash"],
+        "sh" => &["/bin/sh", "/usr/bin/sh"],
         "docker" => &[
             "/opt/homebrew/bin/docker",
             "/usr/local/bin/docker",

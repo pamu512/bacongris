@@ -7,7 +7,9 @@ Preflight dependencies, then run the documented entrypoint (Docker Compose or Py
 Usage:
   python3 workflow_runner.py --workspace /path/to/All_Scripts --workflow intelx
   python3 workflow_runner.py --workspace /path/to/All_Scripts --workflow cve_nvd
+  python3 workflow_runner.py --workspace /path/to/All_Scripts --workflow ransomware
   # CVE: optional --query <keyword> pipes: search, start date, end date, keyword (see --cve-start-date / --cve-end-date)
+  # CTI (cti_workflows.json): --query may be multiline; piped to main.py stdin; omit for interactive
   python3 workflow_runner.py --workspace /path/to/All_Scripts --workflow intelx --query "user@email.com"
   # Piped mode sends: query, start, end, search_limit (see --intelx-*; INTELX_* envs).
 Environment:
@@ -22,6 +24,7 @@ managed” errors), then pip installs into that venv and runs main.py with the v
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -47,6 +50,53 @@ ALIASES = {
     "cve": "cve_nvd",
     "nvd": "cve_nvd",
     "intel_x": "intelx",
+}
+
+# If `cti_workflows.json` is missing from the install, use this (keeps CLI/Rust in sync):
+_DEFAULT_CTI_MANIFEST: Dict[str, Any] = {
+    "workflows": {
+        "ransomware": {
+            "relpath": "Ransomware_live_event_victim",
+            "entry": "main.py",
+            "aliases": [
+                "ransomware_live_event_victim",
+                "ransomware_victim",
+            ],
+        },
+        "asm_fetch": {
+            "relpath": "ASM-fetch-main",
+            "entry": "main.py",
+            "aliases": ["asm", "asm_fetch_main"],
+        },
+        "social_mediav2": {
+            "relpath": "Social_MediaV2",
+            "entry": "main.py",
+            "aliases": ["social", "social_media_v2", "social_mediav2"],
+        },
+        "phishing_social": {
+            "relpath": "Phishing_and_Social_Media_All-in-one",
+            "entry": "main.py",
+            "aliases": [
+                "phishing",
+                "phishing_and_social",
+                "phishing_social_all_in_one",
+            ],
+        },
+        "iocs_crawler": {
+            "relpath": "IOCs-crawler-main",
+            "entry": "main.py",
+            "aliases": ["iocs", "iocs_crawler_main"],
+        },
+        "compromised_mac": {
+            "relpath": "Compromised_user_Mac",
+            "entry": "main.py",
+            "aliases": [
+                "compromised",
+                "compromised_user",
+                "compromised_macos",
+            ],
+        },
+    }
 }
 
 # First-line stdin to intelx-scraper (email, domain, etc.); keep bounded.
@@ -299,6 +349,105 @@ def run_cve_nvd(
     return subprocess.call([str(venv_py), entry], cwd=project)
 
 
+def _load_cti_workflows_object() -> Dict[str, Any]:
+    path = os.environ.get("WORKFLOW_CTI_MANIFEST", "").strip()
+    if path:
+        p = Path(path)
+    else:
+        p = Path(__file__).resolve().parent / "cti_workflows.json"
+    if p.is_file():
+        with p.open(encoding="utf-8") as f:
+            return json.load(f)
+    eprint("Note: cti_workflows.json not found at", p, "— using embedded default manifest.")
+    return _DEFAULT_CTI_MANIFEST
+
+
+def build_cti_alias_to_canonical(manifest: Dict[str, Any]) -> Dict[str, str]:
+    """Map alias (lowercase snake) -> canonical workflow id."""
+    w = manifest.get("workflows", {})
+    out: Dict[str, str] = {}
+    for canon, spec in w.items():
+        c = str(canon).strip().lower().replace("-", "_")
+        out[c] = c
+        for a in spec.get("aliases", []):
+            k = str(a).strip().lower().replace("-", "_")
+            out[k] = c
+    return out
+
+
+def run_cti_venv_generic(
+    project: Path,
+    entry: str,
+    dry_run: bool,
+    skip_pip: bool,
+    query: Optional[str],
+) -> int:
+    """CTI monorepo projects: venv + requirements.txt + main.py; optional piped user input to stdin."""
+    if not project.is_dir():
+        eprint(f"ERROR: Project folder not found: {project}")
+        eprint(
+            "Check relpath in cti_workflows.json and that Settings workspace is the monorepo root (e.g. All_Scripts)."
+        )
+        return 1
+    main_py = project / entry
+    if not main_py.is_file():
+        eprint(
+            f"ERROR: Missing {main_py} — set `entry` in cti_workflows.json to match the README, or add main.py."
+        )
+        return 1
+
+    q = (query or "").strip() if query else ""
+    if skip_pip:
+        eprint("Skipping venv + pip (CVE_NVD_SKIP_PIP or --skip-pip-install).")
+        if dry_run:
+            extra = f" stdin=query({len(q)} bytes)" if q else " interactive"
+            print(
+                f"[dry-run] Would run: {sys.executable} {entry} (no venv, cwd={project}){extra}"
+            )
+            return 0
+        eprint(f"→ Running: {sys.executable} {entry} in {project}")
+        if q:
+            eprint("→ Piping --query to stdin (UTF-8; multiline allowed for CTI user input).")
+            payload = q if (q.endswith("\n") or "\n" in q) else (q + "\n")
+            r = subprocess.run(
+                [sys.executable, entry],
+                cwd=project,
+                input=payload,
+                text=True,
+            )
+            return r.returncode
+        return subprocess.call([sys.executable, entry], cwd=project)
+
+    ve = ensure_project_venv(project, dry_run)
+    if ve != 0:
+        return ve
+    venv_py = venv_python_executable(project)
+    if dry_run and not venv_py.is_file():
+        print(
+            f"[dry-run] Would create venv then run {venv_py} {entry} in {project}"
+        )
+        return 0
+    pr = pip_install_requirements(project, venv_py, dry_run, skip=False)
+    if pr != 0:
+        return pr
+    if dry_run:
+        ex = f" + stdin from --query" if q else " interactive"
+        print(f"[dry-run] Would run: {venv_py} {entry} in {project}{ex}")
+        return 0
+    eprint(f"→ Running: {venv_py} {entry} in {project}")
+    if q:
+        eprint("→ Piping --query to stdin (UTF-8; multiline allowed for CTI user input).")
+        payload = q if (q.endswith("\n") or "\n" in q) else (q + "\n")
+        r = subprocess.run(
+            [str(venv_py), entry],
+            cwd=project,
+            input=payload,
+            text=True,
+        )
+        return r.returncode
+    return subprocess.call([str(venv_py), entry], cwd=project)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -309,7 +458,7 @@ def main() -> int:
     p.add_argument(
         "--workflow",
         required=True,
-        help="intelx | cve | cve_nvd",
+        help="intelx | cve | cve_nvd | see cti_workflows.json (e.g. ransomware, asm_fetch, …)",
     )
     p.add_argument(
         "--dry-run",
@@ -325,7 +474,8 @@ def main() -> int:
         "--query",
         default="",
         help="IntelX: first stdin line in piped mode. "
-        "CVE (cve|cve_nvd): target sources / vendors; runner pipes search, dates, vendors, CVSS v3/v4 (see --cve-cvss*, --cve-*-date; main.py).",
+        "CVE (cve|cve_nvd): target sources / vendors; runner pipes search, dates, vendors, CVSS v3/v4. "
+        "CTI venv projects (cti_workflows.json): entire string piped to main.py stdin when non-empty; omit for interactive.",
     )
     p.add_argument(
         "--cve-start-date",
@@ -374,10 +524,37 @@ def main() -> int:
         eprint("ERROR: --workspace is not a directory:", ws)
         return 1
 
+    cti_obj = _load_cti_workflows_object()
+    cti_wf: Dict[str, Any] = cti_obj.get("workflows", {}) or {}
+    cti_alias = build_cti_alias_to_canonical(cti_obj)
+
     key = args.workflow.strip().lower().replace("-", "_")
+    if key in cti_alias:
+        key = cti_alias[key]
     key = ALIASES.get(key, key)
+
+    if key in cti_wf and key not in WORKFLOWS:
+        specm = cti_wf[key]
+        relp = str(specm.get("relpath", "")).strip()
+        ent = str(specm.get("entry", "main.py")).strip() or "main.py"
+        if not relp:
+            eprint("ERROR: cti_workflows.json entry missing relpath for", key)
+            return 1
+        project = ws / relp
+        cti_q: Optional[str] = (args.query or "").strip() or None
+        if cti_q is not None and cti_q == "":
+            cti_q = None
+        return run_cti_venv_generic(
+            project,
+            ent,
+            args.dry_run,
+            skip_pip,
+            cti_q,
+        )
+
     if key not in WORKFLOWS:
-        eprint("ERROR: Unknown --workflow. Use: intelx, cve, or cve_nvd")
+        known = ["intelx", "cve", "cve_nvd"] + sorted(cti_wf.keys())
+        eprint("ERROR: Unknown --workflow. Known: " + ", ".join(known))
         return 1
 
     spec = WORKFLOWS[key]

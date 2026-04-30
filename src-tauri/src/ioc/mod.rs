@@ -1,4 +1,5 @@
 //! Local IOC table (SQLite): CRUD and STIX / MISP import.
+mod vault_cve_sync;
 mod maintenance;
 mod mitre;
 mod misp;
@@ -12,6 +13,7 @@ pub(crate) use opencti_import::import_from_opencti_stix_cyber_observables;
 pub use misp::extract_from_misp_event;
 pub use stix::extract_from_stix;
 pub use maintenance::IocMaintenanceResult;
+pub use vault_cve_sync::sync_cti_vault_cves_to_iocs;
 
 use chrono::Utc;
 use rusqlite::params;

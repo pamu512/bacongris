@@ -6,18 +6,21 @@ import {
   runTaskVerifier,
   type TaskVerifierResult,
 } from "./lib/agent/verifier";
-import { buildCtiSystemMessageContent, CTI_SYSTEM_PROMPT } from "./lib/agent/systemPrompt";
+import { buildCtiSystemMessageContent } from "./lib/agent/systemPrompt";
+import { VISUAL_WORKSPACE_MAP } from "./lib/visualWorkspaceMap";
 import type {
   ApiRateLimitConfig,
   AppSettings,
   ChatAttachment,
   OllamaMessage,
 } from "./lib/agent/types";
-import type {
-  AgentInfo,
-  AppStateV2,
-  WorkspaceInfo,
-  WorkspaceProfile,
+import {
+  pipVenvBoundStorageKey,
+  type AgentInfo,
+  type AppStateV2,
+  type VenvPipBindReport,
+  type WorkspaceInfo,
+  type WorkspaceProfile,
 } from "./lib/workspace";
 import {
   filesToChatAttachments,
@@ -36,7 +39,14 @@ import {
   findRunCommandDenial,
   type RunCommandDenied,
 } from "./lib/runCommandDenial";
+import { scheduleCveVaultSyncToAppDb } from "./lib/ctiVaultSync";
+import { matchDirectTrustedWorkflowShortcut } from "./lib/directTrustedWorkflow";
+import { WorkflowsGuideModal } from "./WorkflowsGuideModal";
+import { MaintenanceModal } from "./MaintenanceModal";
+import { MaintenanceManager } from "./lib/maintenance";
 import "./App.css";
+
+const WORKFLOWS_GUIDE_DISMISSED_KEY = "bacongris_workflows_guide_dismissed";
 
 type PendingUpload = { path: string; name: string; size: number };
 
@@ -266,6 +276,8 @@ export default function App() {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [promptExtras, setPromptExtras] = useState<LlmContextExtras | null>(null);
   const [importModalOpen, setImportModalOpen] = useState(false);
+  const [workflowsGuideOpen, setWorkflowsGuideOpen] = useState(false);
+  const [maintenanceModalOpen, setMaintenanceModalOpen] = useState(false);
   const [newAgentOpen, setNewAgentOpen] = useState(false);
   const [newAgentTitleDraft, setNewAgentTitleDraft] = useState("Chat");
   /** File paths in workspace uploads/; shown until Send, then embedded in the user message. */
@@ -516,18 +528,83 @@ export default function App() {
 
   useEffect(() => {
     try {
-      if (sessionStorage.getItem("bacongris_v2_import_dismissed")) return;
+      if (localStorage.getItem(WORKFLOWS_GUIDE_DISMISSED_KEY)) {
+        // Still allow legacy import prompt
+        if (sessionStorage.getItem("bacongris_v2_import_dismissed")) return;
+        const raw = localStorage.getItem("bacongris_autosave");
+        if (raw) {
+          const p = JSON.parse(raw) as { messages?: OllamaMessage[] };
+          if (p?.messages && p.messages.length > 0) {
+            setImportModalOpen(true);
+          }
+        }
+        return;
+      }
+      if (sessionStorage.getItem("bacongris_v2_import_dismissed")) {
+        setWorkflowsGuideOpen(true);
+        return;
+      }
       const raw = localStorage.getItem("bacongris_autosave");
       if (raw) {
         const p = JSON.parse(raw) as { messages?: OllamaMessage[] };
         if (p?.messages && p.messages.length > 0) {
           setImportModalOpen(true);
+          return;
         }
       }
     } catch {
       /* ignore */
     }
+    setWorkflowsGuideOpen(true);
   }, []);
+
+  useEffect(() => {
+    MaintenanceManager.start();
+    return () => MaintenanceManager.stop();
+  }, []);
+
+  /**
+   * First time a workspace is mapped: run `pip install -e ..` in each top-level folder
+   * that has `.venv` (binds the workspace-root `pyproject` / `shared_utils` into those venvs).
+   * The backend also drops a `pyproject.toml` template when missing. Skips only if that write
+   * still leaves no `pyproject.toml` (e.g. permissions). Retries on next launch if any step failed.
+   */
+  useEffect(() => {
+    if (!workspace?.pathAccessible || !workspace.effectivePath) {
+      return;
+    }
+    const k = pipVenvBoundStorageKey(workspace.effectivePath);
+    if (localStorage.getItem(k)) {
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      setStatus("Binding project .venv to workspace package (pip install -e ..)…");
+      try {
+        const r = await invoke<VenvPipBindReport>("bind_workspace_venv_pip", {
+          workspaceRoot: workspace.effectivePath,
+        });
+        if (cancelled) {
+          return;
+        }
+        if (r.skippedNoPyproject) {
+          setStatus(r.summary);
+          return;
+        }
+        if (r.failed.length === 0) {
+          localStorage.setItem(k, "1");
+        }
+        setStatus(r.summary);
+      } catch (e) {
+        if (!cancelled) {
+          setStatus(e instanceof Error ? e.message : String(e));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [workspace?.pathAccessible, workspace?.effectivePath]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -582,16 +659,6 @@ export default function App() {
     }, 500);
     return () => window.clearTimeout(t);
   }, [messages]);
-
-  const systemMessage = useMemo<OllamaMessage>(() => {
-    const wsHint = workspace
-      ? `\n\n## Active workspace (use for all paths and run_command cwd)\n- workspaceRoot: ${workspace.effectivePath}\n- scriptsDir: ${workspace.scriptsPath}\n${!workspace.pathAccessible && workspace.pathError ? `- **Path issue:** ${workspace.pathError}\n` : ""}`
-      : "";
-    return {
-      role: "system",
-      content: CTI_SYSTEM_PROMPT + wsHint + formatPromptExtrasBlock(promptExtras),
-    };
-  }, [workspace, promptExtras]);
 
   const cancelMessageEdit = useCallback(() => {
     setEditingIndex(null);
@@ -649,15 +716,20 @@ export default function App() {
     } finally {
       setSessionIndexLoading(false);
     }
+    const systemContent =
+      (await buildCtiSystemMessageContent(workspace, indexJson, {
+        lastUserMessage: systemHintForUserTurn(
+          text,
+          keptAtt?.length ? keptAtt : undefined,
+        ),
+        userTurnText: mergeUserMessageForModel(
+          text,
+          keptAtt?.length ? keptAtt : undefined,
+        ),
+      })) + formatPromptExtrasBlock(promptExtras);
     const systemMsg: OllamaMessage = {
       role: "system",
-      content:
-        buildCtiSystemMessageContent(workspace, indexJson, {
-          lastUserMessage: systemHintForUserTurn(
-            text,
-            keptAtt?.length ? keptAtt : undefined,
-          ),
-        }) + formatPromptExtrasBlock(promptExtras),
+      content: systemContent,
     };
     const transcript: OllamaMessage[] = [systemMsg, ...withoutSystem, userMsg];
 
@@ -814,6 +886,7 @@ export default function App() {
           await persistSettings(next);
           setStatus("Workspace folder saved.");
           await loadAudit();
+          await loadProfilesAgentsAndContext();
           await refreshWorkspace();
         } else {
           setSettings(next);
@@ -833,6 +906,66 @@ export default function App() {
       busy ||
       attachmentReadBusy
     ) {
+      return;
+    }
+    const directWf = matchDirectTrustedWorkflowShortcut(text, {
+      hasInlineAttachments: atch.length > 0,
+      hasWorkspaceUploads: pendingUploads.length > 0,
+    });
+    if (directWf) {
+      setInput("");
+      setPendingAttachments([]);
+      setPendingUploads([]);
+      setBusy(true);
+      setStatus(null);
+      setLastTurnThought(null);
+      setLastTurnVerification(null);
+      const userMsg: OllamaMessage = {
+        role: "user",
+        content: text,
+        localId: crypto.randomUUID(),
+      };
+      const withoutSystem = messages.filter((m) => m.role !== "system");
+      const q = directWf.query?.trim() || null;
+      try {
+        await invoke("run_trusted_workflow", {
+          workflow: directWf.id === "cve" ? "cve" : "intelx",
+          query: q,
+          intelx_start_date: null,
+          intelx_end_date: null,
+          intelx_search_limit: null,
+          cve_start_date: null,
+          cve_end_date: null,
+          cve_cvss: null,
+          cve_cvss_v4: null,
+        });
+        if (directWf.id === "cve") {
+          scheduleCveVaultSyncToAppDb();
+        }
+        const label =
+          directWf.id === "cve"
+            ? `CVE / NVD (${VISUAL_WORKSPACE_MAP.VULNS_CVE})`
+            : `IntelX (${VISUAL_WORKSPACE_MAP.LEAKS_PII})`;
+        const seed = q
+          ? `**Query / seed:** ${q} — piped into the workflow where applicable.`
+          : `Interactive mode (no \`query\` — watch prompts in the **bottom** terminal).`;
+        const assistMsg: OllamaMessage = {
+          role: "assistant",
+          content: `Started **${label}** via the app shortcut (**Ollama not used** for this phrasing). ${seed} Watch the **bottom terminal** for preflight and output.`,
+          localId: crypto.randomUUID(),
+        };
+        setMessages(
+          withStableIds([...withoutSystem, userMsg, assistMsg]),
+        );
+        setStatus(null);
+      } catch (e) {
+        setStatus(e instanceof Error ? e.message : String(e));
+        setMessages(withStableIds([...withoutSystem, userMsg]));
+      } finally {
+        setBusy(false);
+        await loadAudit();
+        await refreshWorkspace();
+      }
       return;
     }
     const attachmentBlock = pendingUploads.length
@@ -883,15 +1016,17 @@ ${list}`;
     } finally {
       setSessionIndexLoading(false);
     }
+    const systemContent =
+      (await buildCtiSystemMessageContent(workspace, indexJson, {
+        lastUserMessage: systemHintForUserTurn(
+          userBodyText,
+          atch.length ? atch : undefined,
+        ),
+        userTurnText: userBodyText,
+      })) + formatPromptExtrasBlock(promptExtras);
     const systemMsg: OllamaMessage = {
       role: "system",
-      content:
-        buildCtiSystemMessageContent(workspace, indexJson, {
-          lastUserMessage: systemHintForUserTurn(
-            userBodyText,
-            atch.length ? atch : undefined,
-          ),
-        }) + formatPromptExtrasBlock(promptExtras),
+      content: systemContent,
     };
     const transcript: OllamaMessage[] = [systemMsg, ...withoutSystem, userMsg];
 
@@ -964,10 +1099,36 @@ ${list}`;
   );
   const indexProjectNames = workspaceIndexProjectNames(sessionIndexJson);
 
+  const openWorkflowsGuide = useCallback(() => {
+    setWorkflowsGuideOpen(true);
+  }, []);
+
+  const dismissWorkflowsGuide = useCallback((dontShowAgain: boolean) => {
+    if (dontShowAgain) {
+      try {
+        localStorage.setItem(WORKFLOWS_GUIDE_DISMISSED_KEY, "1");
+      } catch {
+        /* no storage (private mode) */
+      }
+    }
+    setWorkflowsGuideOpen(false);
+  }, []);
+
+  const openMaintenance = useCallback(() => {
+    setMaintenanceModalOpen(true);
+  }, []);
+
+  const dismissMaintenance = useCallback(() => {
+    setMaintenanceModalOpen(false);
+  }, []);
+
   const onImportLegacy = useCallback(async () => {
     const raw = localStorage.getItem("bacongris_autosave");
     if (!raw) {
       setImportModalOpen(false);
+      if (!localStorage.getItem(WORKFLOWS_GUIDE_DISMISSED_KEY)) {
+        setWorkflowsGuideOpen(true);
+      }
       return;
     }
     try {
@@ -980,6 +1141,9 @@ ${list}`;
       setStatus(`Imported ${m.length} message(s) into the active agent.`);
       await loadProfilesAgentsAndContext();
       await loadConversationFromDisk();
+      if (!localStorage.getItem(WORKFLOWS_GUIDE_DISMISSED_KEY)) {
+        setWorkflowsGuideOpen(true);
+      }
     } catch (e) {
       setStatus(e instanceof Error ? e.message : String(e));
     }
@@ -988,6 +1152,9 @@ ${list}`;
   const onDismissImport = useCallback(() => {
     setImportModalOpen(false);
     sessionStorage.setItem("bacongris_v2_import_dismissed", "1");
+    if (!localStorage.getItem(WORKFLOWS_GUIDE_DISMISSED_KEY)) {
+      setWorkflowsGuideOpen(true);
+    }
   }, []);
 
   const onSelectProfile = useCallback(
@@ -1110,7 +1277,23 @@ ${list}`;
           content: newContent,
         };
       }
-      const transcript: OllamaMessage[] = [systemMessage, ...newMsgs];
+      const lastUser = [...newMsgs].reverse().find((m) => m.role === "user");
+      const systemContent =
+        (await buildCtiSystemMessageContent(workspace, sessionIndexJson, {
+          lastUserMessage: lastUser
+            ? systemHintForUserTurn(lastUser.content ?? "", lastUser.attachments)
+            : undefined,
+          userTurnText: lastUser
+            ? mergeUserMessageForModel(
+                typeof lastUser.content === "string" ? lastUser.content : "",
+                lastUser.attachments,
+              )
+            : "",
+        })) + formatPromptExtrasBlock(promptExtras);
+      const transcript: OllamaMessage[] = [
+        { role: "system", content: systemContent },
+        ...newMsgs,
+      ];
       const signal = runSignal ?? ac!.signal;
       try {
         const { transcript: full, error } = await runAgenticTurn(transcript, {
@@ -1123,7 +1306,7 @@ ${list}`;
         if (ac && runAbortRef.current === ac) runAbortRef.current = null;
       }
     },
-    [messages, systemMessage],
+    [messages, workspace, sessionIndexJson, promptExtras],
   );
 
   const onAllowOnceAndRetryRun = useCallback(async () => {
@@ -1225,6 +1408,22 @@ ${list}`;
           <span className="brand-sub">Local · Ollama · Scripts</span>
         </div>
         <div className="top-actions">
+          <button
+            type="button"
+            className="btn ghost"
+            onClick={openWorkflowsGuide}
+            title="Bundled workflows, parameters, and where outputs go"
+          >
+            Workflows help
+          </button>
+          <button
+            type="button"
+            className="btn ghost"
+            onClick={openMaintenance}
+            title="ASM, CVE, IOC maintenance; IntelX on its own schedule — health in Maintenance"
+          >
+            Maintenance
+          </button>
           <button
             type="button"
             className="btn ghost"
@@ -2032,9 +2231,11 @@ ${list}`;
           <p className="composer-hint" role="note">
             <strong>Attach</strong> adds files to the next message (text, CSV, JSON, logs; max ~256
             KB per file, UTF-8; drag-and-drop here). Bigger or binary files appear as a note for the
-            model — use the workspace and <code>read_text_file</code> when needed. For IntelX / CVE
-            the agent may use <code>run_trusted_workflow</code>. The model does not read the
-            terminal stream—paste output if it should see it.
+            model — use the workspace and <code>read_text_file</code> when needed. Exact phrases{" "}
+            <code>run cve</code> or <code>run intelx</code> (and a few “start …” variants) start the
+            bundled workflow <strong>without</strong> calling the model. For other tasks the agent
+            may use <code>run_trusted_workflow</code>. The model does not read the terminal
+            stream—paste output if it should see it.
           </p>
         </footer>
       </main>
@@ -2080,7 +2281,9 @@ ${list}`;
               <h3>Workspace</h3>
               <p className="field-help">
                 The workspace is always allowlisted. Leave empty to use the app
-                default (<code>…/BacongrisCTIAgent/workspace</code>).
+                default (<code>…/BacongrisCTIAgent/workspace</code>). With a
+                profile selected, saving the path also updates that profile&rsquo;s
+                stored folder (what the sidebar and tools use).
               </p>
               <label className="field">
                 <span>Custom workspace path (optional)</span>
@@ -2384,6 +2587,14 @@ ${list}`;
             </div>
           </div>
         </div>
+      )}
+
+      {workflowsGuideOpen && (
+        <WorkflowsGuideModal onDismiss={dismissWorkflowsGuide} />
+      )}
+
+      {maintenanceModalOpen && (
+        <MaintenanceModal onDismiss={dismissMaintenance} />
       )}
     </div>
   );

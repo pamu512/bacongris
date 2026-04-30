@@ -1428,10 +1428,301 @@ body {
   flex-wrap: wrap;
 }
 
+.workflows-guide-backdrop {
+  z-index: 2010;
+}
+
+.workflows-guide-modal {
+  max-width: min(92vw, 720px);
+  max-height: min(88vh, 900px);
+  overflow: auto;
+  text-align: left;
+}
+
+.workflows-guide-lead {
+  color: var(--text);
+  margin: 0 0 12px;
+}
+
+.workflows-guide-section {
+  margin-bottom: 16px;
+}
+
+.workflows-guide-section h4 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.workflows-guide-list {
+  margin: 0;
+  padding-left: 1.2em;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.workflows-guide-tightlist li {
+  margin-bottom: 4px;
+}
+
+.workflows-guide-muted {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0 0 8px;
+}
+
+.workflows-guide-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.workflows-guide-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.workflows-guide-table th,
+.workflows-guide-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  text-align: left;
+}
+
+.workflows-guide-table th {
+  background: var(--bg);
+  font-weight: 600;
+}
+
+.workflows-guide-table tr:last-child td {
+  border-bottom: none;
+}
+
+.workflows-guide-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.workflows-guide-foot {
+  margin: 12px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 .new-agent-title-field {
   margin-top: 12px;
 }
 
 .new-agent-modal-actions {
   margin-top: 16px;
+}
+
+/* CTI maintenance (see MaintenanceModal + MaintenanceDashboard) */
+.maintenance-modal-backdrop {
+  z-index: 10050;
+}
+
+.maintenance-modal {
+  max-width: min(960px, 96vw);
+  max-height: min(90vh, 900px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.maintenance-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.maintenance-modal-head h3 {
+  margin: 0;
+}
+
+.maintenance-modal-lead {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.maintenance-modal-lead code {
+  font-size: 12px;
+}
+
+.maintenance-dashboard {
+  min-height: 120px;
+  font-size: 12px;
+}
+
+.maintenance-dashboard-toolbar {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.maintenance-stale-banner {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(80, 120, 200, 0.1);
+  border: 1px solid var(--border);
+  color: var(--text-muted, #9aa0a6);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.maintenance-toolbar-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.maintenance-runall-err {
+  margin: 0;
+  color: #c45c4a;
+  font-size: 12px;
+}
+
+.maintenance-load-err {
+  color: #c45c4a;
+  margin: 0;
+}
+
+.maintenance-global-lock {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(200, 160, 60, 0.12);
+  color: #c9a35a;
+  font-size: 12px;
+}
+
+.maintenance-table-wrap {
+  overflow: auto;
+  max-height: min(60vh, 520px);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.maintenance-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.maintenance-table th,
+.maintenance-table td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.maintenance-table th {
+  position: sticky;
+  top: 0;
+  background: var(--panel2, var(--bg));
+  font-weight: 600;
+  z-index: 1;
+}
+
+.maintenance-table tr:last-child td {
+  border-bottom: none;
+}
+
+.maintenance-table .health-ok {
+  /* default */
+}
+
+.maintenance-table .health-warning {
+  background: rgba(200, 160, 60, 0.08);
+}
+
+.maintenance-table .health-error {
+  background: rgba(200, 80, 80, 0.1);
+}
+
+.maintenance-table tr.maintenance-row-cve-stale {
+  box-shadow: inset 3px 0 0 #c9a35a;
+}
+
+.maintenance-cve-pill {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  background: rgba(201, 163, 90, 0.25);
+  color: #d4b87a;
+}
+
+.maintenance-subhint {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.maintenance-table .artifact-path {
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 2px;
+  word-break: break-all;
+  max-width: 14rem;
+}
+
+.maintenance-table .error-detail {
+  color: #c45c4a;
+  font-weight: 700;
+  cursor: help;
+  margin-top: 2px;
+}
+
+.maintenance-table tr.maintenance-error-trace-row td {
+  background: var(--bg-sunken, rgba(0, 0, 0, 0.12));
+  border-top: none;
+  padding-top: 0;
+  padding-bottom: 0.5rem;
+}
+
+.maintenance-table .maintenance-error-details {
+  text-align: left;
+  font-size: 12px;
+}
+
+.maintenance-table .maintenance-error-details > summary {
+  cursor: pointer;
+  color: var(--muted-foreground, #8a8a8a);
+  padding: 0.25rem 0;
+}
+
+.maintenance-table .maintenance-error-pre {
+  max-height: 12rem;
+  overflow: auto;
+  margin: 0.5rem 0 0 0;
+  padding: 0.5rem 0.6rem;
+  font-size: 10px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--bg-elevated, rgba(0, 0, 0, 0.2));
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.maintenance-table .maintenance-row-missing td {
+  color: var(--muted);
+  font-style: italic;
 }

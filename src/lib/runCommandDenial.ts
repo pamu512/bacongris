@@ -1,8 +1,8 @@
 import type { OllamaMessage } from "./agent/types";
 import {
   coerceCwdArg,
-  coerceProgramArg,
   parseToolArguments,
+  resolveRunCommandProgramAndArgv,
 } from "./agent/toolArgs";
 
 export type RunCommandDenied = {
@@ -51,9 +51,10 @@ export function findRunCommandDenial(
       const tc = a.tool_calls.find((t) => t.function?.name === "run_command");
       if (!tc) continue;
       const args = parseToolArguments(tc.function?.arguments);
+      const resolved = resolveRunCommandProgramAndArgv(args);
       return {
-        program: coerceProgramArg(args),
-        args: getArgsArray(args),
+        program: resolved?.program ?? "",
+        args: resolved?.argv ?? getArgsArray(args),
         cwd: coerceCwdArg(args),
         requested: parsed.denied.requested,
         reason: parsed.denied.reason,

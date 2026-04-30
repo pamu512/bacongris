@@ -1,24 +1,51 @@
 /**
- * True when the user is asking for a **list / catalog** of workflows or projects, not to execute one.
- * Also used to **block** `run_trusted_workflow` in the agent loop (see `loop.ts`).
+ * CTI agent routing: high-precision intent detection (catalog vs run, datasets, Docker, IntelX).
+ * `isWorkflowCatalogQuestion` is also used to **block** `run_trusted_workflow` in `loop.ts`.
  */
+
+// --- Shared regex building blocks ---
+const WORKFLOW_IDS = [
+  "intelx",
+  "cve",
+  "cve_nvd",
+  "nvd",
+  "workflow_runner",
+  "ransomware",
+  "asm_fetch",
+  "asm",
+  "social_mediav2",
+  "social",
+  "phishing_social",
+  "phishing",
+  "iocs_crawler",
+  "iocs",
+  "compromised_mac",
+  "compromised",
+].join("|");
+
+const ACTION_VERBS = "run|start|execute|launch|begin";
+
+/** True when the user wants a workflow/project **catalog**, not to execute a workflow this turn. */
 export function isWorkflowCatalogQuestion(userText: string): boolean {
   const t = userText.trim();
   if (t.length < 4) return false;
-  const lower = t.toLowerCase();
-  if (/\b(run|start|execute|launch|begin)\b/.test(lower) && /\b(intelx|cve|cve_nvd|workflow_runner)\b/.test(lower)) {
-    return false;
-  }
-  return (
-    /\b(what|which|list|show|enumerate|tell me (about|what))\b.*\bworkflows?\b/.test(lower) ||
-    /\bworkflows?\b.*\b(available|avilable|avaliable|availble|there|exists?|in (this|the) (repo|workspace)?)\b/.test(
-      lower,
-    ) ||
-    /\b(available|avilable|avaliable|availble)\s+workflows?\b/.test(lower) ||
-    /\b(available|list)\b.*\bworkflows?\b/.test(lower) ||
-    /\bwhat (can|could) i (run|start|use|do here)\b/.test(lower) ||
-    /^\s*list (the )?projects?\s*$/i.test(t.trim())
-  );
+  const lower = t.toLowerCase().replace(/\s+/g, " ");
+
+  const runIntent = new RegExp(`\\b(${ACTION_VERBS})\\b.*\\b(${WORKFLOW_IDS})\\b`).test(lower);
+  if (runIntent) return false;
+
+  const catalogPatterns = [
+    /\b(what|which|list|show|enumerate|tell me (about|what))\b.*\bworkflows?\b/,
+    /\bworkflows?\b.*\b(available|exists?|repo|workspace|there|in (this|the) (repo|workspace)?)\b/,
+    /\bworkflows?\b.*\b(avilable|avaliable|availble)\b/,
+    /\b(avilable|avaliable|availble)\s+workflows?\b/,
+    /\b(available|list)\b.*\bworkflows?\b/,
+    /\bwhat (can|could) i (run|start|use|do|do here)\b/,
+    /\bwhat\s+workflows?\b.*\b(can|could)\s+i\b/,
+    /^\s*list (the )?projects?\s*$/i,
+  ];
+
+  return catalogPatterns.some((re) => re.test(lower));
 }
 
 /**
@@ -27,11 +54,62 @@ export function isWorkflowCatalogQuestion(userText: string): boolean {
 export function getWorkflowCatalogInfoHint(userText: string): string | null {
   if (!isWorkflowCatalogQuestion(userText)) return null;
 
-  return `## Host routing hint (this user turn only) — **workflow / project catalog (informational)**
-The user is asking what **workflows or top-level projects** exist — **not** to start a run in this turn.
+  return `## Routing hint — Workflow catalog (informational only)
+The user is **browsing capabilities**, not asking you to execute a workflow this turn.
 
-- **Do not** call **\`run_trusted_workflow\`**, open **Docker**, or **\`send_integrated_terminal\` workflow_runner** to answer. Starting **intelx** with **no** \`query\` only shows IntelX’s **interactive** “Enter a domain…” prompt in the bottom terminal — that **does not** list Bacongris workflows and wastes the user’s time.
-- **Do** answer from: (1) the **Session workspace index** in the system message (if present), else one **\`analyze_workspace_run_requirements\`** default index; (2) **\`read_text_file\`** on **\`CTI_FUNCTION_MAP.md\`**, **\`SCRIPT_WORKFLOWS.md\`**, or **\`README.txt\`** at **workspaceRoot** / **\`scripts/\`** when they exist; (3) in prose, state that **\`run_trusted_workflow\`** only bundles **\`intelx\`** (→ Intelx_Crawler) and **\`cve\`** / **\`cve_nvd\`** (→ CVE_Project_NVD), and list other folders from the index in short bullets (e.g. ASM-fetch-main, Compromised_user_Mac) with their roles.`;
+- **Strict block:** Do **not** call **\`run_trusted_workflow\`** for **\`intelx\`** without a **\`query\`** — it opens IntelX’s **interactive** prompt in the terminal and does **not** answer “what workflows exist.”
+- **Do not** start **Docker** or **\`workflow_runner\`** just to list options.
+- **Do** answer from: (1) the **Session workspace index** in the system message when present, else one default **\`analyze_workspace_run_requirements\`**; (2) **\`read_text_file\`** on **\`CTI_FUNCTION_MAP.md\`**, **\`SCRIPT_WORKFLOWS.md\`**, or **\`README.txt\`** / **\`scripts/\`** when they exist; (3) short prose: **\`intelx\`**, **\`cve\` / \`cve_nvd\`**, **\`iocs_crawler\`**, **\`ransomware\`**, **\`asm_fetch\`**, etc., matching **\`cti_workflows.json\`** and top-level folders from the index.`;
+}
+
+/**
+ * "When was the last update?" / "update all datasets" — avoid fake container APIs; enforce workspace + real tools.
+ */
+export function getDatasetUpdateAndFreshnessHint(userText: string): string | null {
+  const t = userText.trim();
+  if (t.length < 8) return null;
+  const lower = t.toLowerCase().replace(/\s+/g, " ");
+
+  const updateAll =
+    (/\bupdate all\b/.test(lower) && /\b(dataset|data|feeds?|sources?|crawl|project)/.test(lower)) ||
+    /^\s*update all the datasets\s*\.?\s*$/i.test(t) ||
+    /\b(refresh|re-?sync|sync) all (the )?(data|dataset|feeds?|crawl)/.test(lower) ||
+    /\b(run|start) (all|every) (crawl|feeds?|dataset|updates?)/.test(lower);
+
+  const lastUpdate =
+    /\b(when|what (time|date)|time|date)\b.*\b(last|previous|recent|stale|fresh)\b.*\b(update|sync|run|refresh)\b/.test(
+      lower,
+    ) ||
+    /\b(when|time|date|stale|fresh|last)\b.*\b(update|sync|run|refresh)\b/.test(lower) ||
+    /^\s*when was the last update\s*\.?\s*$/i.test(t) ||
+    (/\b(last|stale|fresh|freshness)\b/.test(lower) &&
+      /\b(update|sync|dataset|data|cve|nvd|intelx|feed|crawl)\b/.test(lower) &&
+      !/\b(run|start|execute|launch)\s+(intelx|cve|iocs?)/.test(lower));
+
+  if (!updateAll && !lastUpdate) return null;
+
+  const topic =
+    updateAll && lastUpdate
+      ? "“last update” and refresh all"
+      : updateAll
+        ? "refresh / update all datasets"
+        : "“last update” / recency only";
+
+  const updateAllRunBlock = updateAll
+    ? `
+
+- **UI shortcut (user has the app open):** The **Maintenance** modal tracks **ASM, CVE, IOC, IntelX**. **“Update all datasets (maintenance)”** runs **ASM → CVE → IOC** only; **IntelX** is not in that one-click (use its own schedule, **\`run_trusted_workflow\`** with workflow **\`intelx\`**, a **\`query\`**, or the project README). Open **Maintenance** in the header for the one-click core refresh.
+- **CRITICAL — “update all” is not a directory listing:** \`get_environment\` + \`list_directory\` **alone do not update anything.** After confirming projects exist, you must **start real work** in this session: **\`run_trusted_workflow\`** (one call per workflow id) and/or **\`send_integrated_terminal\`** / **\`run_command\`** per each project’s **\`README.md\`**. Stopping at env + list is **not** a completed request.
+- **NEVER** use **\`write_text_file\`** to create or overwrite \`maintenance_status.json\` (or any \`*status*.json\` / sync ledger) with **invented** JSON or **hallucinated** ISO timestamps — that **fakes** a successful run and is **forbidden**. You cannot “record” an update you did not execute. To **read** live maintenance state in chat, use **\`system_maintenance_status\`** (or \`read_text_file\` on that path only if the file truly exists and you are not fabricating).
+- **Flow:** (1) env + list (or \`system_maintenance_status\` to see current recency), (2) ask to approve if steps are heavy, (3) \`run_trusted_workflow\` for the first id (e.g. \`cve\` or \`iocs_crawler\`) **or** terminal line from README, then continue per project. IntelX often needs a **\`query\`**; CVE/NVD and CTI venv projects may be long-running — be explicit.`
+    : "";
+
+  return `## Host routing hint (this user turn) — **dataset ${topic}**
+The user is asking about **recency of local data** or to **re-run** collectors. **Do not** use \`container.exec\` or any tool name not in the real tool list.
+
+- **Workspace first:** call **\`get_environment\`**, then **\`list_directory\`** on \`.\` (or read **Session workspace index**). The **CTI monorepo** (folders like \`IOCs-crawler-main\`, \`CVE_Project_NVD\`, \`Intelx_Crawler\`, \`ASM-fetch-main\`, \`Ransomware_live_event_victim\`, …) must live under **\`workspaceRoot\`**. The app’s **default** empty workspace is only a stub — if those directories are **missing**, tell the user to open **Settings** and set **workspace** to the folder that **contains** those project dirs (e.g. their \`All_Scripts\` copy). **Never** \`cd IOCs-crawler-main\` or start Celery scripts until the folder is confirmed to exist under **\`workspaceRoot\`** (use \`list_directory\`).
+- **“Last update” (informational):** the **\`system_maintenance_status\`** tool returns persisted per-project \`lastSuccessfulSync\` / \`currentStatus\` (when the app has run). The **“Local Intelligence is Stale”** banner refers to the **knowledge** snapshot in this chat, not a single global clock. If only **when** is asked, you can answer from that tool after a quick env check; **no** new runs are required.
+- **“Update all” (mutating):** one **\`run_trusted_workflow\` per id** in order — \`intelx\` (needs **\`query\`** for non-interactive use), \`cve\` / \`cve_nvd\`, then each **\`cti_workflows.json\` id** (\`ransomware\`, \`asm_fetch\`, \`iocs_crawler\`, **…**). For Celery/IOCs-style projects, \`send_integrated_terminal\` with \`cwd\` = that folder and the exact \`celery\` / \`docker compose\` lines in its README. **Ask for approval** when steps start workers or long jobs.${updateAllRunBlock}`;
 }
 
 /**
@@ -74,14 +152,11 @@ This message plausibly matches **EXPOSURE / LEAK** or **IntelX-style** work (not
 export function getDockerComposeWorkingDirHint(userText: string): string | null {
   const t = userText.trim();
   if (t.length < 2) return null;
-  const lower = t.toLowerCase();
-  const match =
+  const needsDocker =
     /\b(docker\s+compose|docker-compose|compose\.ya?ml|compose\s+run|intelx-scraper)\b/i.test(
       t,
-    ) ||
-    /\bintelx\b/.test(lower) ||
-    /no configuration file provided|not found.*compose/i.test(t);
-  if (!match) return null;
+    ) || /no configuration file provided|not found.*compose/i.test(t);
+  if (!needsDocker) return null;
 
   return `## Host routing hint — Docker Compose **working directory**
 - \`docker compose\` loads \`compose.yaml\` / \`docker-compose.yml\` from the **current directory** (or from \`-f\`). Running from the monorepo **root** when the file is under a subfolder produces: *no configuration file provided: not found*.
@@ -92,6 +167,32 @@ export function getDockerComposeWorkingDirHint(userText: string): string | null 
 /**
  * "run cve" / "CVE project" → **CVE_Project_NVD** (not Intelx_Crawler).
  */
+/**
+ * "Run social media v2" / "run my project" — user names a **workspace top-level folder**, not an API function.
+ */
+export function getRunNamedProjectIntentHint(userText: string): string | null {
+  const t = userText.trim();
+  if (t.length < 6) return null;
+  const m = /^\s*(run|start|execute|launch)\s+(.+)$/i.exec(t);
+  if (!m) return null;
+  const rest = m[2]!.trim();
+  if (rest.length < 2) return null;
+  const r = rest.toLowerCase();
+  if (r === "intelx" || r === "cve" || r === "nvd" || r === "cve nvd") return null;
+  if (/^(the\s+)?(cti|bacongris|agent)\b/.test(r)) return null;
+  if (/\b(what|which|how do i|workflows? available)\b/.test(t.toLowerCase())) {
+    return null;
+  }
+  if (isWorkflowCatalogQuestion(t)) return null;
+
+  return `## Host routing hint (this user turn) — **Run a user-named project (not a new API)**
+The user is asking to **start** something they named in natural language (e.g. *social media v2*, a folder or script). **This is not a “missing” tool in the function list** — the **built-in** tools are generic (**read_text_file**, **list_directory**, **send_integrated_terminal**, **run_command**). Workspace app folders (IntelX, **Phishing** / **Social_MediaV2** / **Brand** trees, **CVE_Project_NVD**, etc.) are run via those tools.
+
+- **Do not** say there is *no* function, or that only *threat* / *enrichment* APIs exist. **Do** match the name to a **top-level project folder** from the **Session workspace index** (or **\`list_directory\` \`.\`** / workspace root) — folder names in the index use **underscores**, not spaces: e.g. *Social Media V2* → \`Social_MediaV2\` or a listed **\`Phishing_and_…\`** / **\`...Social_Media...\`** name.
+- **Read** that project’s **README** (\`read_text_file\` …) then **\`send_integrated_terminal\`**, with **\`cwd\`** = that folder, using the real entry point from the doc (\`python3\`, \`./scripts/venv_run.sh\`, \`docker compose\`, etc.). Use **\`run_command\`** only when the README is non-interactive and the user needs stdout in chat.
+- The intent table: **phishing / brand / social (impersonation)** often maps to **\`Phishing_and_Social_Media_All-in-one\`** (or a similarly named top-level folder) **— not** a generic *“only VirusTotal/IOC”* list. If the name does not match any top-level folder, **\`list_directory\`** the workspace, pick the closest match, and state which folder you chose.`;
+}
+
 export function getRunCveProjectHint(userText: string): string | null {
   const t = userText.trim();
   if (t.length < 3) return null;
@@ -100,13 +201,15 @@ export function getRunCveProjectHint(userText: string): string | null {
     /cve_?project_?nvd|cve_?nvd|nvd\s+project/.test(lower) ||
     /^\s*run\s+cve\s*$/i.test(t) ||
     /\b(run|start)\s+cve\b/.test(lower) ||
+    /\b(update|refresh|sync|pull|download)\s+(the\s+)?cve\b/.test(lower) ||
+    /\b(update|refresh|sync)\s+(the\s+)?nvd\b/.test(lower) ||
     (/\bcve\b/.test(lower) && /\b(run|start|exec|open)\b/.test(lower));
   if (!cveNvd) return null;
 
   return `## Host routing hint (this user turn only)
-The user is asking to **run the local CVE / NVD project** in this workspace: **\`CVE_Project_NVD\`**. That is a **different folder** from \`Intelx_Crawler\` (IntelX / leak-style workflows).
+The user is asking to **run or refresh the local CVE / NVD project** in this workspace: **\`CVE_Project_NVD\`**. That is a **different folder** from \`Intelx_Crawler\` (IntelX / leak-style workflows).
 
-- Use **\`read_text_file\` \`CVE_Project_NVD/README.md\`**, then **\`send_integrated_terminal\`** with \`text\` lines under that project (e.g. \`cd CVE_Project_NVD && python3 main.py\`), per the README. **Do not** start Intelx, Docker, or random \`echo\` “workspace verified” scripts unless the user named that project.`;
+- Use **\`read_text_file\` \`CVE_Project_NVD/README.md\`** (never bare \`README.md\` at the workspace root), then **\`run_trusted_workflow\`** with \`workflow\` \`cve\` / \`cve_nvd\` **or** **\`send_integrated_terminal\`** with \`cwd\` / \`cd\` under that project per the README. When the run has populated **\`cti_vault.db\`**, call **\`sync_cti_vault_cves_to_iocs\`** so **\`ioc_search\`** (app SQLite) includes those CVEs. **Do not** start Intelx, Docker, or random \`echo\` “workspace verified” scripts unless the user named that project.`;
 }
 
 /**
@@ -181,4 +284,29 @@ You do **not** get the **integrated terminal** log in the next model message. Th
 - **Do not** re-run the default \`analyze_workspace_run_requirements\` index for this, and do **not** switch to an unrelated project (Ransomware, etc.). The phrases **"analyse the results"** / **"analyze the results"** mean \`list_directory\` + \`read_text_file\` on IntelX paths — **never** the full-workspace index.
 - If the last terminal run showed **0 records** / **no CSVs**, say so and suggest checking the **email spelling** (typos in the \`@\` local part are common) and re-running with **\`run_trusted_workflow\`** and a **corrected \`query\`**.
 - If paths are missing, ask for a **paste** of the bottom terminal.`;
+}
+
+/**
+ * User asks whether the agent can use the internet / web / online — clarify mediated tools.
+ */
+export function getExplicitWebAccessRoutingHint(userText: string): string | null {
+  const t = userText.trim();
+  if (t.length < 6) return null;
+  const lower = t.toLowerCase();
+  const asks =
+    /\b(do you|can you|are you able to)\b[\s\S]{0,80}\b(access|use|reach|browse|get on)\b[\s\S]{0,40}\b(the )?(internet|web|online)\b/.test(
+      lower,
+    ) ||
+    /\b(internet access|web access|online access|access to the web|access the internet)\b/.test(
+      lower,
+    ) ||
+    /\bcan you (search|look up|fetch)\b[\s\S]{0,20}\b(the )?web\b/.test(lower) ||
+    /\b(have you got|do you have)\b[\s\S]{0,40}\b(internet|web access)\b/.test(lower);
+  if (!asks) return null;
+
+  return `## Host routing hint (this user turn) — **Web / internet / online**
+The user is asking about **internet or web access** (or ability to use online resources).
+
+- Answer clearly: you do **not** have a private browser or silent always-on internet—but the host allows **per-request, user-directed** outbound calls via real tools: **\`api_request\`** (HTTPS; **api_name** + **url** + **headers**; keys in Settings), **\`enrich_ioc\` / \`enrich_virustotal\` / \`enrich_shodan\` / \`enrich_otx\` / \`enrich_abusech\`**, **feeds** (\`add_feed\`, \`poll_feed\`, …), or **\`run_command\` / \`run_trusted_workflow\`** when a workspace README documents remote fetches.
+- When they **explicitly** want live or “latest” public data, **use** those tools for this request—do **not** refuse with a blanket “no internet.” If URLs or API keys are missing, say what to configure in **Settings** or ask them to paste—never invent secrets.`;
 }

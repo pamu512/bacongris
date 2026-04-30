@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "description": "Python venv+main.py projects under the CTI monorepo (All_Scripts). Editable: copy to workspace and point WORKFLOW_CTI_MANIFEST, or override entry per folder.",
+  "workflows": {
+    "ransomware": {
+      "relpath": "Ransomware_live_event_victim",
+      "entry": "main.py",
+      "aliases": ["ransomware_live_event_victim", "ransomware_victim"]
+    },
+    "asm_fetch": {
+      "relpath": "ASM-fetch-main",
+      "entry": "main.py",
+      "aliases": ["asm", "asm_fetch_main"]
+    },
+    "social_mediav2": {
+      "relpath": "Social_MediaV2",
+      "entry": "main.py",
+      "aliases": ["social", "social_media_v2", "social_mediav2"]
+    },
+    "phishing_social": {
+      "relpath": "Phishing_and_Social_Media_All-in-one",
+      "entry": "main.py",
+      "aliases": [
+        "phishing",
+        "phishing_and_social",
+        "phishing_social_all_in_one"
+      ]
+    },
+    "iocs_crawler": {
+      "relpath": "IOCs-crawler-main",
+      "entry": "main.py",
+      "aliases": ["iocs", "iocs_crawler_main"]
+    },
+    "compromised_mac": {
+      "relpath": "Compromised_user_Mac",
+      "entry": "main.py",
+      "aliases": ["compromised", "compromised_user", "compromised_macos"]
+    }
+  }
+}

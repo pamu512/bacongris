@@ -4,12 +4,28 @@ use serde::Serialize;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::app_data::merged_settings_for_runtime;
 use crate::app_data::AppStore;
 use crate::audit::append_audit;
 use crate::settings::{app_config_dir, resolve_workspace_dir, AppSettings};
 use tauri::Manager;
+
+/// Same content as `cti_vault_bootstrap/pyproject.toml` at the repo root — embedded so every
+/// resolved workspace (including the app default) gets an editable `cti-vault` root package
+/// for `shared_utils` once that folder is present, without a manual copy step.
+const CTI_VAULT_PYPROJECT_TOML: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../cti_vault_bootstrap/pyproject.toml"));
+
+/// If missing, write the CTI template `pyproject.toml` (does not overwrite a user file).
+fn ensure_cti_vault_pyproject_toml(root: &Path) {
+    let p = root.join("pyproject.toml");
+    if p.is_file() {
+        return;
+    }
+    let _ = fs::write(&p, CTI_VAULT_PYPROJECT_TOML);
+}
 
 /// One-shot idempotent Python runner for multi-project workspaces. Written into **scripts/** the
 /// first time the workspace is opened so users do not repeat venv+pip+run steps.
@@ -164,6 +180,7 @@ pub fn workspace_info_for_app(app: &tauri::AppHandle) -> Result<WorkspaceInfo, S
         });
     }
     std::fs::create_dir_all(&root).map_err(|e| format!("workspace: {e}"))?;
+    ensure_cti_vault_pyproject_toml(&root);
     let scripts = root.join("scripts");
     std::fs::create_dir_all(&scripts).map_err(|e| format!("scripts folder: {e}"))?;
     ensure_venv_run_script(&scripts);
@@ -182,6 +199,7 @@ pub fn workspace_info_for_app(app: &tauri::AppHandle) -> Result<WorkspaceInfo, S
 pub(crate) fn workspace_info_from_settings(settings: &AppSettings) -> Result<WorkspaceInfo, String> {
     let root = resolve_workspace_dir(settings)?;
     std::fs::create_dir_all(&root).map_err(|e| format!("workspace: {e}"))?;
+    ensure_cti_vault_pyproject_toml(&root);
     let scripts = root.join("scripts");
     std::fs::create_dir_all(&scripts).map_err(|e| format!("scripts folder: {e}"))?;
     ensure_venv_run_script(&scripts);
@@ -473,4 +491,155 @@ fn sanitize_file_component(name: &str) -> String {
     } else {
         t.to_string()
     }
+}
+
+/// Path to `pip` / `pip3` inside a `.venv` (Windows vs Unix).
+fn pip_executable_in_venv(venv: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        for n in ["Scripts/pip.exe", "Scripts/pip3.exe"] {
+            let p = venv.join(n);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        for n in ["bin/pip", "bin/pip3"] {
+            let p = venv.join(n);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipBindFailure {
+    pub project: String,
+    pub error: String,
+}
+
+/// Result of `pip install -e ..` in each top-level folder that has `.venv` (binds `shared_utils` at workspace root).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VenvPipBindReport {
+    pub ok: bool,
+    pub summary: String,
+    pub skipped_no_pyproject: bool,
+    /// Project folder names that had a `.venv` and were processed.
+    pub projects: Vec<String>,
+    pub succeeded: Vec<String>,
+    pub failed: Vec<PipBindFailure>,
+}
+
+#[tauri::command]
+pub fn bind_workspace_venv_pip(workspace_root: String) -> Result<VenvPipBindReport, String> {
+    let root = PathBuf::from(workspace_root.trim());
+    let root = dunce::canonicalize(&root).map_err(|e| format!("workspace path: {e}"))?;
+    if !root.is_dir() {
+        return Err("workspace is not a directory".to_string());
+    }
+    ensure_cti_vault_pyproject_toml(&root);
+    if !root.join("pyproject.toml").is_file() {
+        return Ok(VenvPipBindReport {
+            ok: true,
+            summary: "No pyproject.toml at workspace root — skipped. Open the workspace (or restart the app) so a template is written, or add your own. Copy `cti_vault_bootstrap/shared_utils` into the root if `pip install -e ..` still fails."
+                .to_string(),
+            skipped_no_pyproject: true,
+            projects: vec![],
+            succeeded: vec![],
+            failed: vec![],
+        });
+    }
+
+    let mut projects: Vec<String> = vec![];
+    let mut succeeded: Vec<String> = vec![];
+    let mut failed: Vec<PipBindFailure> = vec![];
+
+    let rd = fs::read_dir(&root).map_err(|e| format!("read_dir: {e}"))?;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if name == "scripts" {
+            continue;
+        }
+        let venv = path.join(".venv");
+        if !venv.is_dir() {
+            continue;
+        }
+        projects.push(name.clone());
+        let Some(pip) = pip_executable_in_venv(&venv) else {
+            failed.push(PipBindFailure {
+                project: name,
+                error: "no pip in .venv (bin/Scripts missing pip)".to_string(),
+            });
+            continue;
+        };
+        let out = Command::new(&pip)
+            .args(["install", "-e", ".."])
+            .current_dir(&path)
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                succeeded.push(name);
+            }
+            Ok(o) => {
+                let e = String::from_utf8_lossy(&o.stderr);
+                let s = String::from_utf8_lossy(&o.stdout);
+                let msg = format!("{e}{s}").trim().to_string();
+                failed.push(PipBindFailure {
+                    project: name,
+                    error: if msg.is_empty() {
+                        format!("exit {}", o.status)
+                    } else {
+                        msg
+                    },
+                });
+            }
+            Err(e) => {
+                failed.push(PipBindFailure {
+                    project: name,
+                    error: e.to_string(),
+                });
+            }
+        }
+    }
+
+    let ok = failed.is_empty();
+    let summary = if projects.is_empty() {
+        "No top-level project folders with .venv found (nothing to bind).".to_string()
+    } else if failed.is_empty() {
+        format!(
+            "Bound {} project venv(s) to workspace root (pip install -e ..).",
+            succeeded.len()
+        )
+    } else {
+        format!(
+            "pip install -e: {} ok, {} failed (see host logs / fix venvs).",
+            succeeded.len(),
+            failed.len()
+        )
+    };
+    Ok(VenvPipBindReport {
+        ok,
+        summary,
+        skipped_no_pyproject: false,
+        projects,
+        succeeded,
+        failed,
+    })
 }

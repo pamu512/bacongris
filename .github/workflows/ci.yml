@@ -19,6 +19,24 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Workflow runner (Python + manifest)
+        run: |
+          set -e
+          mkdir -p /tmp/bgw/{Ransomware_live_event_victim,CVE_Project_NVD,IOCs-crawler-main}
+          touch /tmp/bgw/Ransomware_live_event_victim/main.py
+          touch /tmp/bgw/CVE_Project_NVD/main.py
+          touch /tmp/bgw/IOCs-crawler-main/main.py
+          python3 scripts/workflow_runner.py --workspace /tmp/bgw --workflow ransomware --dry-run
+          python3 scripts/workflow_runner.py --workspace /tmp/bgw --workflow cve --dry-run
+          python3 scripts/workflow_runner.py --workspace /tmp/bgw --workflow iocs_crawler --dry-run
+      - name: CTI vault bootstrap (Python)
+        run: |
+          set -e
+          cd cti_vault_bootstrap
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install -e . -q
+          python -m unittest discover -s tests -v
       - run: npm run build
 
   tauri:

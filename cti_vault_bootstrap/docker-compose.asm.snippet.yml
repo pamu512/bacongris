@@ -1,0 +1,15 @@
+# Mount the host workspace so the container writes the same cti_vault.db as host-side Python.
+# On Linux, set user to match the host to avoid root-owned files on bind mounts.
+#
+#   export CTI_MONOREPO_HOST_PATH=/path/to/All_Scripts
+#   export UID GID  # on Linux: $(id -u) $(id -g)
+
+services:
+  asm:
+    # image: your-asm-image
+    volumes:
+      - ${CTI_MONOREPO_HOST_PATH:-.}:/workspace:rw
+    environment:
+      CTI_VAULT_PATH: /workspace/cti_vault.db
+    working_dir: /workspace/ASM-fetch-main
+    user: "${UID:-1000}:${GID:-1000}"

@@ -88,7 +88,13 @@ async fn try_chat(
     if !res.status().is_success() {
         let status = res.status();
         let txt = res.text().await.unwrap_or_default();
-        return Err(format!("Ollama HTTP {}: {}", status, txt));
+        let mut err = format!("Ollama HTTP {}: {}", status, txt);
+        if status.as_u16() == 500 && txt.contains("parsing tool call") {
+            err.push_str(
+                " (Tip: some models emit invalid tool JSON; update Ollama, try another model, or use Clear chat if a bad turn is stuck in history.)",
+            );
+        }
+        return Err(err);
     }
 
     let v: Value = res

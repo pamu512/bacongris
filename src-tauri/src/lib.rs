@@ -37,8 +37,8 @@ use settings::{load_settings, save_settings, settings_path, AppSettings};
 use session::{session_allow_for_program, SessionAllowlist};
 use workflow_runner::run_trusted_workflow;
 use workspace::{
-    get_workspace_info, ingest_files_from_data, ingest_uploads, open_workspace_in_os,
-    prepare_workspace_layout,
+    bind_workspace_venv_pip, get_workspace_info, ingest_files_from_data, ingest_uploads,
+    open_workspace_in_os, prepare_workspace_layout,
 };
 use workspace_analyze::analyze_workspace_run_requirements;
 use api::{api_request, HttpApiState};
@@ -54,7 +54,7 @@ use feeds::{
 };
 use ioc::{
     ioc_create, ioc_delete, ioc_export_stix, ioc_import_misp, ioc_import_stix, ioc_maintenance,
-    ioc_search, ioc_update, run_ioc_maintenance_on_conn,
+    ioc_search, ioc_update, run_ioc_maintenance_on_conn, sync_cti_vault_cves_to_iocs,
 };
 use threat_time::{
     campaign_compare, campaign_track, emerging_threats, ioc_timeline, record_sighting,
@@ -71,7 +71,12 @@ fn load_settings_cmd(app: tauri::AppHandle) -> Result<AppSettings, String> {
 
 #[tauri::command]
 fn save_settings_cmd(app: tauri::AppHandle, settings: AppSettings) -> Result<(), String> {
-    save_settings(&app, &settings)
+    save_settings(&app, &settings)?;
+    let store = app.state::<AppStore>();
+    store
+        .sync_active_profile_path_from_settings(&settings)
+        .map_err(|e| format!("sync active profile path: {e}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -118,6 +123,7 @@ pub fn run() {
             get_recent_audit,
             clear_audit_log,
             get_workspace_info,
+            bind_workspace_venv_pip,
             ingest_uploads,
             ingest_files_from_data,
             prepare_workspace_layout,
@@ -150,6 +156,7 @@ pub fn run() {
             ioc_import_misp,
             ioc_export_stix,
             ioc_maintenance,
+            sync_cti_vault_cves_to_iocs,
             api_request,
             enrich_ioc,
             enrich_virustotal,

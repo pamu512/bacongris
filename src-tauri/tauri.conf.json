@@ -35,7 +35,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["../scripts/workflow_runner.py"],
+    "resources": [
+      "../scripts/workflow_runner.py",
+      "../scripts/cti_workflows.json"
+    ],
     "macOS": {
       "minimumSystemVersion": "10.15"
     },

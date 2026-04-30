@@ -12,6 +12,10 @@ dist
 .vite
 **/__pycache__
 *.pyc
+cti_vault_bootstrap/.venv
+# Local CTI vault dev DB at repo root (template projects)
+/cti_vault.db
+/cti_vault.db-*
 dist-ssr
 .vite
 *.local

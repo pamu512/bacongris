@@ -3,6 +3,7 @@ import type { OllamaMessage, OllamaToolCall } from "./types";
 import { getOllamaTools } from "./tools";
 import { agentLog, agentWarn, summarizeOllamaToolCalls } from "./agentDebug";
 import {
+  canonicalizeHallucinatedToolName,
   tryExtractBashFictionSendTerminal,
   tryExtractToolCallsFromText,
   tryRepairRunToolToTerminal,
@@ -11,13 +12,13 @@ import {
   coerceCwdArg,
   coerceFileContentArg,
   coercePathArg,
-  coerceProgramArg,
+  isBareWorkspaceReadmePath,
+  resolveRunCommandProgramAndArgv,
   coerceTerminalDataArg,
   ensurePtyLineSubmitted,
   normalizeTerminalEscapeLiterals,
   preferPython3Command,
   parseAnalyzeWorkspaceCallArgs,
-  getRunCommandArgv,
   parseToolArguments,
   parseIocSearchArgs,
   parseIocStringFields,
@@ -33,8 +34,10 @@ import {
   coerceCveCvssV4Arg,
   terminalTextFromRunCommandStyleArgs,
 } from "./toolArgs";
-import { prepareForOllamaRequest } from "./ollamaMessages";
+import { normalizeToolCallsForWire, prepareForOllamaRequest } from "./ollamaMessages";
 import { isWorkflowCatalogQuestion } from "./routingHints";
+import { preFlightCheck } from "./OllamaClient";
+import { scheduleCveVaultSyncToAppDb } from "../ctiVaultSync";
 
 function pickRawJsonArg(args: Record<string, unknown>): string | undefined {
   const keys = ["raw_json", "rawJson", "raw"];
@@ -117,6 +120,23 @@ function getLastUserMessageText(msgs: OllamaMessage[]): string {
   return "";
 }
 
+function prependStaleWarningToLastAssistant(
+  msgs: OllamaMessage[],
+  warning: string | undefined,
+): void {
+  if (!warning) return;
+  for (let i = msgs.length - 1; i >= 0; i -= 1) {
+    if (msgs[i].role === "assistant") {
+      const c = msgs[i].content;
+      const t = typeof c === "string" ? c : "";
+      if (t.startsWith(warning)) return;
+      const next = t ? `${warning}\n\n${t}` : warning;
+      msgs[i] = { ...msgs[i], content: next };
+      return;
+    }
+  }
+}
+
 /** If the model emitted tool calls *and* long prose, keep prose out of the main chat (collapsible). */
 const ASSISTANT_COT_COLLAPSE_MIN_LEN = 320;
 
@@ -184,6 +204,10 @@ function extractAssistantMessage(res: Record<string, unknown>): OllamaMessage {
     }
   }
 
+  if (tool_calls?.length) {
+    tool_calls = normalizeToolCallsForWire(tool_calls);
+  }
+
   const out: OllamaMessage = {
     role: role as "assistant",
     content,
@@ -234,6 +258,12 @@ async function dispatchTool(
               "Missing path. Pass path as a string (absolute path under your workspace). If the model sent arguments as nested JSON, it is normalized — try again with path only.",
           });
         }
+        if (isBareWorkspaceReadmePath(path)) {
+          return JSON.stringify({
+            error:
+              "Bare `README.md` resolves to the workspace root, which often has no such file. Use the project-relative path from **get_environment** / the workspace index (e.g. `CVE_Project_NVD/README.md`). Call **list_directory** on the project folder if unsure.",
+          });
+        }
         const text = await invoke<string>("read_text_file", { path });
         return text;
       }
@@ -250,11 +280,17 @@ async function dispatchTool(
         return JSON.stringify(w, null, 2);
       }
       case "list_directory": {
-        const path = coercePathArg(args);
-        if (!path) {
-          return JSON.stringify({ error: "Missing path for list_directory." });
+        let path = coercePathArg(args);
+        if (!path || !path.trim()) {
+          path = ".";
         }
-        const rows = await invoke<unknown>("list_directory", { path });
+        if (isBareWorkspaceReadmePath(path)) {
+          return JSON.stringify({
+            error:
+              "Bare `README.md` is not a directory. Use a folder path (e.g. `Ransomware_live_event_victim` or `Ransomware_live_event_victim/`) then **read_text_file** on that project’s `README.md`.",
+          });
+        }
+        const rows = await invoke<unknown>("list_directory", { path: path.trim() });
         return JSON.stringify(rows, null, 2);
       }
       case "analyze_workspace_run_requirements": {
@@ -271,7 +307,7 @@ async function dispatchTool(
         if (!workflow) {
           return JSON.stringify({
             error:
-              "Missing workflow. Pass workflow: \"intelx\" | \"cve\" | \"cve_nvd\" (CVE_Project_NVD).",
+              "Missing workflow. Pass workflow: \"intelx\" | \"cve\" | \"cve_nvd\" | \"ransomware\" | \"asm_fetch\" | \"social_mediav2\" | \"phishing_social\" | \"iocs_crawler\" | \"compromised_mac\" (see scripts/cti_workflows.json for aliases).",
           });
         }
         const queryRaw = coerceTrustedWorkflowQueryArg(args);
@@ -283,6 +319,13 @@ async function dispatchTool(
         const cveEd = coerceCveEndDateArg(args).trim() || null;
         const cveCs = coerceCveCvssArg(args).trim() || null;
         const cveCsV4 = coerceCveCvssV4Arg(args).trim() || null;
+        const wfNorm = workflow
+          .trim()
+          .toLowerCase()
+          .replace(/-/g, "_")
+          .replace(/\s+/g, "_");
+        const isCveWorkflow =
+          wfNorm === "cve" || wfNorm === "cve_nvd" || wfNorm === "nvd";
         const result = await invoke<unknown>("run_trusted_workflow", {
           workflow,
           query,
@@ -294,18 +337,45 @@ async function dispatchTool(
           cve_cvss: cveCs,
           cve_cvss_v4: cveCsV4,
         });
+        if (isCveWorkflow) {
+          scheduleCveVaultSyncToAppDb();
+        }
+        if (result && typeof result === "object" && !Array.isArray(result)) {
+          return JSON.stringify(
+            {
+              ...(result as Record<string, unknown>),
+              ...(isCveWorkflow
+                ? {
+                    ctiVaultToAppIocSync: "scheduled",
+                    ctiVaultToAppIocSyncHint:
+                      "Queued merges from workspace `cti_vault.db` (`cve_data`) into the app `iocs` table (immediate + 8s + 45s). Long NVD runs may finish later — call **sync_cti_vault_cves_to_iocs** again, then **ioc_search** with `ioc_type: \"cve\"`.",
+                  }
+                : {}),
+            },
+            null,
+            2,
+          );
+        }
         return JSON.stringify(result, null, 2);
       }
+      case "sync_cti_vault_cves_to_iocs": {
+        const lim = parseOptI64Num(args, ["limit", "row_limit", "maxRows"]);
+        const out = await invoke<unknown>("sync_cti_vault_cves_to_iocs", {
+          limit: lim != null ? lim : null,
+        });
+        return JSON.stringify(out, null, 2);
+      }
       case "run_command":
-      case "run": {
-        const program = coerceProgramArg(args);
-        if (!program) {
+      case "run":
+      case "run_terminal": {
+        const resolved = resolveRunCommandProgramAndArgv(args);
+        if (!resolved) {
           return JSON.stringify({
             error:
-              "Missing program. Use an allowed executable name (e.g. python3) or full path. For Docker Compose v2 prefer: program docker, args [\"compose\",\"-f\",composeFile,\"up\",...].",
+              "Missing **program** + **args**, or a shell line in **cmd** / **text**. Examples: `program` \"python3\", `args` [\"-c\",\"print(1)\"]; or `cmd` \"ls -la\" (runs as bash -c); for Docker Compose v2: `program` \"docker\", `args` [\"compose\",\"-f\",composeFile,\"up\",...].",
           });
         }
-        const argv = getRunCommandArgv(args);
+        const { program, argv } = resolved;
         const cwd = coerceCwdArg(args);
         if (signal?.aborted) {
           return CANCELLED_JSON;
@@ -319,6 +389,16 @@ async function dispatchTool(
           return CANCELLED_JSON;
         }
         return JSON.stringify(result, null, 2);
+      }
+      case "terminal_output": {
+        return JSON.stringify(
+          {
+            ok: false,
+            note: "The host does not stream the integrated terminal to the model. Use list_directory and read_text_file on workspace outputs (e.g. Intelx_Crawler/csv_output/), or ask the user to paste from the bottom panel. To start IntelX use run_trusted_workflow with workflow \"intelx\" and an optional query—do not use run() with program \"intelx\" (not a binary).",
+          },
+          null,
+          2,
+        );
       }
       case "send_integrated_terminal": {
         let raw = coerceTerminalDataArg(args);
@@ -350,6 +430,11 @@ async function dispatchTool(
           message:
             "Text was sent to the integrated terminal. Watch the bottom panel for output; stdout/stderr is not returned to chat.",
         });
+      }
+      case "system_maintenance_status": {
+        const { MaintenanceManager } = await import("../maintenance");
+        const state = await MaintenanceManager.getState();
+        return JSON.stringify(state, null, 2);
       }
       case "ioc_create": {
         const f = parseIocStringFields(args);
@@ -675,14 +760,28 @@ async function dispatchTool(
         });
         return JSON.stringify(r, null, 2);
       }
-      default:
-        return JSON.stringify({ error: `Unknown tool: ${name}` });
+      default: {
+        const tools = getOllamaTools() as {
+          type?: string;
+          function?: { name?: string };
+        }[];
+        const names = tools
+          .filter((t) => t.type === "function" && t.function?.name)
+          .map((t) => t.function!.name as string);
+        const sample = names.join(", ");
+        return JSON.stringify({
+          error: `Unknown tool: ${name}. The host only exposes: ${sample}. (There is no container.exec / docker.exec tool — use run_trusted_workflow, send_integrated_terminal, or run_command with paths under workspaceRoot from get_environment.)`,
+        });
+      }
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     agentWarn("dispatchTool error", name, msg);
     let errOut = msg;
-    if ((name === "run_command" || name === "run") && /pip/i.test(coerceProgramArg(args) || "")) {
+    if (
+      (name === "run_command" || name === "run") &&
+      /pip/i.test(resolveRunCommandProgramAndArgv(args)?.program ?? "")
+    ) {
       errOut = `${msg} For Python installs, prefer **program** \`python3\` and **args** \`["-m","pip","install",...]\` (or add \`pip3\`/\`pip\` to allowed executables in Settings).`;
     }
     return JSON.stringify({ error: errOut });
@@ -708,8 +807,23 @@ export async function runAgenticTurn(
   const tools = getOllamaTools();
   let current = [...transcript];
   let steps = 0;
+  let preFlight: Awaited<ReturnType<typeof preFlightCheck>>;
+  try {
+    preFlight = await preFlightCheck();
+  } catch (e) {
+    agentWarn("preFlightCheck failed", e);
+    preFlight = {
+      stale: false,
+      warningLine: undefined,
+      freshnessSummary: "",
+    };
+  }
 
-  agentLog("runAgenticTurn start", { transcriptMessages: current.length, tools: tools.length });
+  agentLog("runAgenticTurn start", {
+    transcriptMessages: current.length,
+    tools: tools.length,
+    localIntelligenceStale: preFlight.stale,
+  });
 
   while (steps++ < MAX_AGENT_STEPS) {
     if (signal?.aborted) {
@@ -767,6 +881,11 @@ export async function runAgenticTurn(
       }
       let name = tc.function?.name ?? "";
       let args = parseToolArguments(tc.function?.arguments as unknown);
+      const fixedName = canonicalizeHallucinatedToolName(name, args);
+      if (fixedName !== name) {
+        agentLog("dispatchTool: canonicalized tool name", name, "→", fixedName);
+        name = fixedName;
+      }
       const repaired = tryRepairRunToolToTerminal(name, args);
       if (repaired) {
         agentLog("repaired hallucinated tool", name, "→ send_integrated_terminal");
@@ -787,7 +906,7 @@ export async function runAgenticTurn(
         content = JSON.stringify({
           error: "blocked_workflow_catalog_intent",
           message:
-            "This user turn is a **list / catalog** question (what workflows or projects exist). The host does **not** run **run_trusted_workflow** here—starting **intelx** or **cve** would launch the runner/Docker, not print a catalog. Answer in prose: (1) **run_trusted_workflow** only accepts **workflow** `intelx` | `cve` | `cve_nvd` (CVE uses **CVE_Project_NVD**); (2) list other **top-level project folders** from the Session workspace index (or from **analyze_workspace_run_requirements** if the thread has no index yet); (3) optionally **read_text_file** `CTI_FUNCTION_MAP.md` / `SCRIPT_WORKFLOWS.md` when they exist. Keep the reply short—bullets, not a full venv guide for every folder unless the user asked for setup.",
+            "This user turn is a **list / catalog** question (what workflows or projects exist). The host does **not** run **run_trusted_workflow** here—starting a workflow would launch the runner, not print a catalog. Answer in prose: (1) **run_trusted_workflow** **workflow** values include `intelx`, `cve`/`cve_nvd`, and the CTI venv ids in `cti_workflows.json` (e.g. `ransomware`, `asm_fetch`, `social_mediav2`, …) mapping to monorepo folders; (2) list **top-level project folders** from the Session workspace index (or **analyze_workspace_run_requirements**); (3) optionally **read_text_file** `CTI_FUNCTION_MAP.md` / `SCRIPT_WORKFLOWS.md` when they exist. Keep the reply short.",
         });
       } else {
         content = await dispatchTool(name, args, signal);
@@ -812,11 +931,13 @@ export async function runAgenticTurn(
   }
 
   if (steps >= MAX_AGENT_STEPS) {
+    prependStaleWarningToLastAssistant(current, preFlight.warningLine);
     return {
       transcript: current,
       error: "Stopped: maximum agent steps reached.",
     };
   }
 
+  prependStaleWarningToLastAssistant(current, preFlight.warningLine);
   return { transcript: current };
 }

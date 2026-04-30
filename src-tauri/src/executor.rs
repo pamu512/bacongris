@@ -103,6 +103,9 @@ pub struct CommandResult {
 pub struct DirEntryInfo {
     pub name: String,
     pub is_dir: bool,
+    /// UNIX epoch millis when the entry was last modified. Omitted for directories and on failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_ms: Option<u64>,
 }
 
 async fn read_limited<R: tokio::io::AsyncRead + Unpin>(
@@ -351,6 +354,9 @@ fn build_docker_sandbox_invocation(
     Ok((docker_bin.to_path_buf(), d))
 }
 
+/// Hard cap for optional per-call overrides (CVE/NVD downloads can run for hours on Tor).
+const RUN_COMMAND_TIMEOUT_OVERRIDE_MAX_SECS: u64 = 8 * 60 * 60;
+
 #[tauri::command]
 pub async fn run_command(
     app: tauri::AppHandle,
@@ -359,6 +365,7 @@ pub async fn run_command(
     program: String,
     args: Vec<String>,
     cwd: Option<String>,
+    timeout_override_secs: Option<u64>,
 ) -> Result<CommandResult, String> {
     let settings = merged_settings_for_runtime(&app)?;
     let program = program.trim().to_string();
@@ -420,7 +427,13 @@ pub async fn run_command(
     // For now, we return the assessment and let frontend handle confirmation
 
     let max = settings.max_output_bytes.max(1024);
-    let dur = Duration::from_secs(settings.execution_timeout_secs.max(1));
+    let dur = Duration::from_secs(
+        match timeout_override_secs {
+            None => settings.execution_timeout_secs,
+            Some(0) => settings.execution_timeout_secs,
+            Some(n) => n.min(RUN_COMMAND_TIMEOUT_OVERRIDE_MAX_SECS).max(1),
+        },
+    );
 
     let (spawn_prog, spawn_argv) = if settings.use_docker_sandbox {
         let docker_bin = resolve_program_path(
@@ -617,10 +630,20 @@ pub fn list_directory(app: tauri::AppHandle, path: String) -> Result<Vec<DirEntr
     for ent in read {
         let ent = ent.map_err(|e| format!("entry: {e}"))?;
         let meta = ent.metadata().ok();
-        let is_dir = meta.map(|m| m.is_dir()).unwrap_or(false);
+        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let modified_ms = if is_dir {
+            None
+        } else {
+            meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+        };
         out.push(DirEntryInfo {
             name: ent.file_name().to_string_lossy().into_owned(),
             is_dir,
+            modified_ms,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -650,6 +673,26 @@ pub struct EnvironmentInfo {
     pub python3_version: Option<String>,
     /// `python --version` when on PATH and distinct from the python3 probe; `None` if not found.
     pub python_version: Option<String>,
+    /// `docker --version` stdout when the CLI is on PATH; `None` if not found.
+    pub docker_version: Option<String>,
+}
+
+fn probe_docker_version() -> Option<String> {
+    let output = std::process::Command::new("docker")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let line = if !out.is_empty() { out } else { err };
+    if line.is_empty() {
+        None
+    } else {
+        Some(line)
+    }
 }
 
 fn probe_python_version(exe: &str) -> Option<String> {
@@ -675,6 +718,7 @@ pub fn get_environment(app: tauri::AppHandle) -> Result<EnvironmentInfo, String>
     let ws = workspace_info_for_app(&app)?;
     let python3_version = probe_python_version("python3");
     let python_version = probe_python_version("python");
+    let docker_version = probe_docker_version();
     Ok(EnvironmentInfo {
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
@@ -689,5 +733,6 @@ pub fn get_environment(app: tauri::AppHandle) -> Result<EnvironmentInfo, String>
         workspace_is_custom: ws.is_custom_location,
         python3_version,
         python_version,
+        docker_version,
     })
 }

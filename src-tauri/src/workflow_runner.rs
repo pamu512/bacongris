@@ -6,9 +6,8 @@ use tauri::path::BaseDirectory;
 use tauri::AppHandle;
 use tauri::Manager;
 
+use crate::app_data::AppStore;
 use crate::pty_terminal::terminal_ensure_write;
-use crate::settings::resolve_workspace_dir;
-use crate::settings::load_settings;
 
 fn pick_python_prefix() -> String {
     #[cfg(windows)]
@@ -80,28 +79,54 @@ fn resolve_workflow_runner_script(app: &AppHandle) -> Result<PathBuf, String> {
         })
 }
 
+/// Normalizes to `intelx` / `cve_nvd` / or a `snake_case` id (passed through to
+/// `workflow_runner.py` — `cti_workflows.json` supplies aliases and project paths).
 fn normalize_workflow_id(s: &str) -> Result<String, String> {
-    let t = s.trim().to_lowercase().replace(['-', ' '], "_");
-    match t.as_str() {
-        "intelx" => Ok("intelx".into()),
-        "cve" | "cve_nvd" | "nvd" => Ok("cve_nvd".into()),
-        _ => Err(format!(
-            "Unknown workflow \"{s}\". Use: intelx, cve, or cve_nvd."
-        )),
+    let mut t = s.trim().to_lowercase().replace(['-', ' '], "_");
+    if t.is_empty() {
+        return Err("Empty workflow id.".to_string());
     }
+    if t == "intel_x" {
+        t = "intelx".into();
+    } else if matches!(t.as_str(), "cve" | "nvd" | "cve_nvd") {
+        t = "cve_nvd".into();
+    }
+    if !t
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(format!(
+            "Invalid workflow id \"{s}\": use letters, digits, and underscores (see intelx, cve_nvd, cti_workflows.json ids)."
+        ));
+    }
+    if t.len() > 64 {
+        return Err("Workflow id too long (max 64).".to_string());
+    }
+    Ok(t)
 }
 
-const MAX_QUERY_CHARS: usize = 2048;
+const MAX_QUERY_LINE_CHARS: usize = 2048;
+const MAX_QUERY_BLOCK_CHARS: usize = 16384;
 
-/// IntelX `--query`: single line, bounded length (matches `workflow_runner.py`).
-fn sanitize_workflow_query(q: Option<String>) -> Option<String> {
+/// IntelX / CVE `query` / `--query`: first line only (matches `workflow_runner.py`).
+fn sanitize_workflow_query_line(q: Option<String>) -> Option<String> {
     let full = q?;
     let s = full.lines().next().unwrap_or("").trim();
     if s.is_empty() {
         return None;
     }
-    let t: String = s.chars().take(MAX_QUERY_CHARS).collect();
+    let t: String = s.chars().take(MAX_QUERY_LINE_CHARS).collect();
     Some(t)
+}
+
+/// Other CTI workflows: full user input, multiline, bounded (stdin to `main.py`).
+fn sanitize_workflow_query_block(q: Option<String>) -> Option<String> {
+    let full = q?;
+    let s = full.trim();
+    if s.is_empty() {
+        return None;
+    }
+    Some(s.chars().take(MAX_QUERY_BLOCK_CHARS).collect())
 }
 
 fn sanitize_short_line(q: Option<String>, max: usize) -> Option<String> {
@@ -246,11 +271,18 @@ pub fn run_trusted_workflow(
     cve_cvss: Option<String>,
     cve_cvss_v4: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let settings = load_settings(&app)?;
-    let workspace = resolve_workspace_dir(&settings)?;
+    // Same root as the integrated terminal (`effective_workspace_path`: active profile or
+    // default `…/BacongrisCTIAgent/workspace`), not the legacy `settings.json` path alone.
+    let store = app.state::<AppStore>();
+    let workspace = store.effective_workspace_path(&app)?;
     let script = resolve_workflow_runner_script(&app)?;
     let wid = normalize_workflow_id(&workflow)?;
-    let qref = sanitize_workflow_query(query);
+    let use_line_query = matches!(wid.as_str(), "intelx" | "cve_nvd");
+    let qref = if use_line_query {
+        sanitize_workflow_query_line(query)
+    } else {
+        sanitize_workflow_query_block(query)
+    };
     let sref = sanitize_short_line(intelx_start_date, 32);
     let eref = sanitize_short_line(intelx_end_date, 32);
     let lref = sanitize_short_line(intelx_search_limit, 32);
@@ -294,8 +326,10 @@ pub fn run_trusted_workflow(
     let message = if wid == "intelx" {
         "Trusted workflow command was sent to the integrated terminal (watch the bottom panel only). This return only confirms the one-liner was sent — the IntelX job may still be running. Piped mode sends four lines (query, start, end, search limit); the JSON intelx* fields are the effective values (defaults match workflow_runner.py when the tool omits them). Do not state that CSVs already exist; say to watch the terminal or use list_directory after the run. See postRun.inChatNextStep."
             .to_string()
-    } else {
+    } else if wid == "cve_nvd" {
         other_workflow_message.to_string()
+    } else {
+        "Trusted workflow (CTI project) command was sent to the integrated terminal. The runner uses cti_workflows.json for the project folder and main.py; with **query** set, that text is piped to stdin (multiline allowed). This JSON only confirms the command was sent—watch the bottom panel.".to_string()
     };
     let body: serde_json::Value = if wid == "intelx" {
         // Match `workflow_runner.py` `_intelx_piped_stdin` — all four lines are sent; `intelx*`
@@ -322,7 +356,7 @@ pub fn run_trusted_workflow(
             "workflowRunnerScript": script_display,
             "commandSent": command_sent,
         })
-    } else {
+    } else if wid == "cve_nvd" {
         let ceff_s = cve_sref
             .clone()
             .unwrap_or_else(|| "2000-01-01".to_string());
@@ -344,6 +378,19 @@ pub fn run_trusted_workflow(
             },
             "cveCvss": cve_css_ref.clone().unwrap_or_default(),
             "cveCvssV4": cve_cv4_ref.clone().unwrap_or_default(),
+            "preview": preview,
+            "workspaceRoot": workspace_display,
+            "workflowRunnerScript": script_display,
+            "commandSent": command_sent,
+        })
+    } else {
+        serde_json::json!({
+            "ok": true,
+            "message": message,
+            "workflow": wid,
+            "query": qref,
+            "queryMode": "stdin_to_main_py",
+            "note": "Monorepo CTI projects from scripts/cti_workflows.json; optional query is piped as UTF-8 stdin when non-empty.",
             "preview": preview,
             "workspaceRoot": workspace_display,
             "workflowRunnerScript": script_display,

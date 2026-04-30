@@ -446,6 +446,34 @@ impl AppStore {
         drop(g);
         resolve_workspace_dir(&base)
     }
+
+    /// After **Settings** saves `workspacePath` to `settings.json`, mirror that resolved path into the
+    /// **active** profile row. `effective_workspace_path` prefers the profile’s `path` when a profile
+    /// is active; without this sync, the UI would keep showing the old default while the text field
+    /// showed the new path.
+    pub fn sync_active_profile_path_from_settings(
+        &self,
+        settings: &AppSettings,
+    ) -> Result<(), String> {
+        let root = resolve_workspace_dir(settings)?;
+        let path_str = root.to_string_lossy().to_string();
+        let g = self.db.lock().map_err(|e| e.to_string())?;
+        let active: Option<String> = g
+            .query_row(
+                "SELECT active_profile_id FROM app_state WHERE id = 1",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if let Some(pid) = active {
+            g.execute(
+                "UPDATE profiles SET path = ?1 WHERE id = ?2",
+                params![&path_str, &pid],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
 }
 
 /// Effective `AppSettings` (global + active profile allowlist add-ons) for `paths` and `executor`.

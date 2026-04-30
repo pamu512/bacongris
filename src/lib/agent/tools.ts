@@ -8,7 +8,7 @@ export function getOllamaTools(): unknown[] {
       function: {
         name: "get_environment",
         description:
-          "Return OS, arch, home, temp, process cwd, **workspaceRoot** / **scriptsDir** from Settings (same as the sidebar), and **python3Version** / **pythonVersion** strings from probing `python3 --version` and `python --version` on PATH (null if not found). Use these before recommending pip/venv/`python` runs: if both Python fields are null, tell the user to install Python 3 and fix PATH first. Never use `cwd` for file paths or run_command: that is the app process directory (e.g. src-tauri), not your workspace.",
+          "Return OS, arch, home, temp, process cwd, **workspaceRoot** / **scriptsDir** from Settings (same as the sidebar), **python3Version** / **pythonVersion** (from `python3` / `python` on PATH), and **dockerVersion** (from `docker --version`, null if missing). Use these before recommending pip/venv/`python` runs: if both Python fields are null, tell the user to install Python 3 and fix PATH first. For `docker compose` / ASM work, if **dockerVersion** is null, tell the user to install Docker Desktop or the Docker CLI. Never use `cwd` for file paths or run_command: that is the app process directory (e.g. src-tauri), not your workspace.",
         parameters: {
           type: "object",
           properties: {},
@@ -20,7 +20,7 @@ export function getOllamaTools(): unknown[] {
       function: {
         name: "read_text_file",
         description:
-          "Read a UTF-8 text file under the workspace or allowlisted roots. Path may be **relative to workspaceRoot** (e.g. CVE_Project_NVD/README.md) or absolute. **IntelX CSVs** are often `Intelx_Crawler/csv_output/<subfolder>/<file>.csv`—**list_directory** from `csv_output` and use the **exact** `name` in this field; do not retype long `...@_...` names from memory. If read fails, the error may name the real parent—**list_directory** that path next.",
+          "Read a UTF-8 text file under the workspace or allowlisted roots. Path may be **relative to workspaceRoot** (e.g. CVE_Project_NVD/README.md) or absolute. **Do not** pass bare `README.md` unless the workspace root actually has that file—prefer `ProjectFolder/README.md`. **IntelX CSVs** are often `Intelx_Crawler/csv_output/<subfolder>/<file>.csv`—**list_directory** from `csv_output` and use the **exact** `name` in this field; do not retype long `...@_...` names from memory. If read fails, the error may name the real parent—**list_directory** that path next.",
         parameters: {
           type: "object",
           properties: {
@@ -39,7 +39,7 @@ export function getOllamaTools(): unknown[] {
       function: {
         name: "write_text_file",
         description:
-          "Create or **replace** a **UTF-8** text file under allowlisted roots (usually **workspaceRoot**). Parent directories are created as needed. On overwrite, the previous file is **backed up** (same folder, with a .backup timestamp). Use to fix script/source after **run_command** shows errors, add small utilities, or append durable notes. Pass **content** (full new file text). For large binaries or non-text files, do not use this tool.",
+          "Create or **replace** a **UTF-8** text file under allowlisted roots (usually **workspaceRoot**). Parent directories are created as needed. On overwrite, the previous file is **backed up** (same folder, with a .backup timestamp). Use to fix script/source after **run_command** shows errors, add small utilities, or append durable notes. Pass **content** (full new file text). **Do not** use this to invent \`maintenance_status.json\` (or any sync/ledger) with made-up timestamps — the app and **system_maintenance_status** own that state. For large binaries or non-text files, do not use this tool.",
         parameters: {
           type: "object",
           properties: {
@@ -58,17 +58,17 @@ export function getOllamaTools(): unknown[] {
       function: {
         name: "list_directory",
         description:
-          "List files and folders in a directory (names + isDir only). Path may be relative to workspaceRoot or absolute under allowlisted roots.",
+          "List files and folders in a directory. Each entry has **name**, **isDir**, and **modifiedMs** (UNIX epoch ms) for **files** only; directories omit **modifiedMs**. Path may be relative to workspaceRoot or absolute under allowlisted roots. Omit **path** to list the workspace root (`.`). **Do not** pass `README.md` as path — that is a file, not a folder; use a project directory then **read_text_file** for README.",
         parameters: {
           type: "object",
           properties: {
             path: {
               type: "string",
               description:
-                "Directory path: relative to workspace root or absolute under allowlisted roots",
+                "Directory path: relative to workspace root or absolute under allowlisted roots (omit = workspace root).",
             },
           },
-          required: ["path"],
+          required: [],
         },
       },
     },
@@ -105,19 +105,19 @@ export function getOllamaTools(): unknown[] {
       function: {
         name: "run_trusted_workflow",
         description:
-          "**Not** for *“what workflows are available?”* / *list workflows* / project **catalog** questions—answer those with the **Session workspace index**, **analyze_workspace_run_requirements** (if no index yet), and **read_text_file** on **CTI_FUNCTION_MAP.md** / **SCRIPT_WORKFLOWS.md** / README; **do not** start this tool just to list options. **Preferred for known CTI workflows** when the user wants to **start** a **new** run (not just read docs): runs Bacongris’ bundled **cross-platform** `workflow_runner.py` in the **integrated terminal** — it **preflights** (Docker / Python / folders) and starts the **documented** entrypoint. Workflows: **intelx** → `Intelx_Crawler` + Docker (default intelx-scraper). For **leak/breach checks** set **query**; the runner **pipes four stdin lines** (query, start/end dates, then **search limit** — default 2000 unless **intelx_search_limit**). **cve** / **cve_nvd** → `CVE_Project_NVD` + `main.py` (ignore **intelx_** fields). With **query** set, the runner pipes **six stdin lines**: **`search` → dates → vendors (query) → CVSS v3 → CVSS v4** (optional **cve_cvss** / **cve_cvss_v4**, else blank lines; **cve_start_date** / **cve_end_date** or wide defaults). Without **query**, the app runs the **interactive** menu. Use after you matched intent (leak/IntelX vs CVE/NVD). **Not** for “analyze the findings / summarize prior IntelX output in chat” — that is **list_directory** + **read_text_file** on `Intelx_Crawler/csv_output/`. **Do not** call with **intelx** and no **query** unless the user explicitly wants the **fully interactive** IntelX prompt. **Do not** use for arbitrary projects without a defined workflow — use **send_integrated_terminal** + README instead. On success, **commandSent** is the exact one-liner (absolute paths to `workflow_runner.py` and workspace). If the user runs the same thing in an external shell, they must copy **commandSent** or the real path — a literal `...` in a path is invalid. **preview** matches **commandSent**. IntelX JSON also has effective date/limit fields; the run may still be in progress. Output is only in the bottom terminal.",
+          "**Not** for *“what workflows are available?”* / *list workflows* / project **catalog** questions—answer those with the **Session workspace index**, **analyze_workspace_run_requirements** (if no index yet), and **read_text_file** on **CTI_FUNCTION_MAP.md** / **SCRIPT_WORKFLOWS.md** / README; **do not** start this tool just to list options. **Preferred** when the user wants to **start** a run that matches a **defined workflow** in `workflow_runner.py` + `cti_workflows.json`: the runner **preflights** and starts the **documented** entry in the **integrated terminal**. **intelx** → `Intelx_Crawler` (Docker; **query** = first of four piped lines; **intelx_*** date/limit). **cve** / **cve_nvd** → `CVE_Project_NVD` + `main.py` (NVD-specific piped stdin; **cve_*** fields; ignore **intelx_***). **CTI venv projects** (same mechanism, `main.py` + venv; paths in `cti_workflows.json`): **ransomware** → `Ransomware_live_event_victim`; **asm_fetch** → `ASM-fetch-main`; **social_mediav2** → `Social_MediaV2`; **phishing_social** → `Phishing_and_Social_Media_All-in-one`; **iocs_crawler** → `IOCs-crawler-main`; **compromised_mac** → `Compromised_user_Mac` — for these, **query** is the **entire** user input string piped to **stdin** to `main.py` (multiline allowed, max ~16k); omit **query** for **interactive** (TTY). Aliases in JSON: e.g. `asm` → `asm_fetch`. If a project’s `main.py` does not read stdin, **read_text_file** README and use **send_integrated_terminal** instead. **Not** for “summarize last IntelX output”—use **list_directory** + **read_text_file** on `Intelx_Crawler/csv_output/`. On success, **commandSent** is the exact one-liner. Output is only in the bottom terminal.",
         parameters: {
           type: "object",
           properties: {
             workflow: {
               type: "string",
               description:
-                "intelx | cve | cve_nvd (cve and cve_nvd are the same: CVE_Project_NVD)",
+                "intelx | cve | cve_nvd | ransomware | asm_fetch | social_mediav2 | phishing_social | iocs_crawler | compromised_mac (plus aliases: asm, social, iocs, compromised, … — see cti_workflows.json)",
             },
             query: {
               type: "string",
               description:
-                "**IntelX:** email, domain, URL, or seeds — first piped line. **CVE / cve_nvd:** vendor / target sources (line before CVSS). Omit for fully interactive mode.",
+                "**IntelX:** first piped line. **CVE:** vendor line (NVD flow). **CTI venv projects (ransomware, asm_fetch, …):** full user input, piped to main.py as stdin when non-empty (newlines allowed). Omit for interactive menu.",
             },
             intelx_start_date: {
               type: "string",
@@ -164,7 +164,7 @@ export function getOllamaTools(): unknown[] {
       function: {
         name: "send_integrated_terminal",
         description:
-          "**Default way to run project commands** in the **bottom** terminal. The host only runs this via **real API `tool_calls`**, with JSON `arguments` (e.g. `text` + optional `cwd`)—**do not** pretend to invoke it with a ` ```bash ` line. Creates a shell if none; if **text** has no line ending, one is **appended** so a one-liner **runs**. You may use multiple lines with real `\\n` or **cwd** to start in a project, or one `cd Project && cmd` from the workspace. **The assistant does not get shell stdout in chat**; use **read_text_file** / **list_directory** to read files — not `cat` or guessed `ls` (typos in long names break paths). If you need stdout in chat, use **run_command**; for interactive TTY, Docker, **pip**/**python3**/**docker compose** (add **-T** on `docker compose exec` when piping), use this. Prefer **run_trusted_workflow** for bundled **intelx** / **cve** when the user asked for that. Ask the user to **paste** errors if you need them.",
+          "The **function name** in `tool_calls` must be exactly **`send_integrated_terminal`** (not `get_environment` or a `tool.*` prefix). You must pass **`text`** (or `data`) with the full shell line(s); empty `arguments` is invalid. **Default way to run project commands** in the **bottom** terminal. The host only runs this via **real API `tool_calls`**, with JSON `arguments` (e.g. `text` + optional `cwd`)—**do not** pretend to invoke it with a ` ```bash ` line. Creates a shell if none; if **text** has no line ending, one is **appended** so a one-liner **runs**. You may use multiple lines with real `\\n` or **cwd** to start in a project, or one `cd Project && cmd` from the workspace. **The assistant does not get shell stdout in chat**; use **read_text_file** / **list_directory** to read files — not `cat` or guessed `ls` (typos in long names break paths). If you need stdout in chat, use **run_command**; for interactive TTY, Docker, **pip**/**python3**/**docker compose** (add **-T** on `docker compose exec` when piping), use this. Prefer **run_trusted_workflow** for **intelx** / **cve** / **cti_workflows** ids (ransomware, asm_fetch, …) when the run matches. Ask the user to **paste** errors if you need them.",
         parameters: {
           type: "object",
           properties: {
@@ -188,11 +188,19 @@ export function getOllamaTools(): unknown[] {
       function: {
         name: "run_command",
         description:
-          "Run a program with **captured** stdout/stderr in the next **tool** message (headless, not the bottom terminal). Use an absolute path under an allowlisted root, or a **bare** name (e.g. `python3`) that matches an allowed executable. Bare `docker` / `docker-compose` resolve from standard install paths. **Prefer `send_integrated_terminal`** when the user should **see** the run. For `pip install`, use **program** `python3` and **args** `[\"-m\",\"pip\",\"install\",...]`. Tool results may include **denied** / **suggestedPath**; the user can approve in-app or add paths in Settings. If **program** is not allowlisted, the host returns a denial in the result JSON.",
+          "Run a program with **captured** stdout/stderr in the next **tool** message (headless, not the bottom terminal). Either (**program** + **args**) **or** a single shell line in **cmd** / **text** (host runs `bash -c` with allowlisted `bash`). Use an absolute path under an allowlisted root, or a **bare** name (e.g. `python3`) that matches an allowed executable. Bare `docker` / `docker-compose` resolve from standard install paths. **Prefer `send_integrated_terminal`** when the user should **see** the run. For `pip install`, use **program** `python3` and **args** `[\"-m\",\"pip\",\"install\",...]`. Tool results may include **denied** / **suggestedPath**; the user can approve in-app or add paths in Settings. If **program** is not allowlisted, the host returns a denial in the result JSON.",
         parameters: {
           type: "object",
           properties: {
-            program: { type: "string" },
+            program: {
+              type: "string",
+              description: "Executable name or path (omit if using **cmd** instead).",
+            },
+            cmd: {
+              type: "string",
+              description:
+                "One shell line (e.g. `ls -la`) — runs as **bash -c** with optional **cwd**. Do not use this field for `program`+`args` style.",
+            },
             args: {
               type: "array",
               items: { type: "string" },
@@ -208,7 +216,7 @@ export function getOllamaTools(): unknown[] {
               description: "Working directory; must be allowlisted if set",
             },
           },
-          required: ["program"],
+          required: [],
         },
       },
     },
@@ -217,11 +225,15 @@ export function getOllamaTools(): unknown[] {
       function: {
         name: "run",
         description:
-          "**Alias of `run_command` — identical parameters and behavior.** Use when the model or README naturally says “run” with `program` + `args` (captured stdout/stderr; allowlisted binaries; may include **denied** / **risk_assessment**). For interactive / Docker / menus, still use `send_integrated_terminal`.",
+          "**Alias of `run_command` — identical parameters and behavior.** Use when the model or README naturally says “run” with `program` + `args` (captured stdout/stderr; allowlisted binaries; may include **denied** / **risk_assessment**). For **run_trusted_workflow**-backed projects (see **cti_workflows.json** + tool list), prefer **`run_trusted_workflow`** over inventing a shell one-liner; **do not** set `program` to `intelx` / `intelex` (typos, not a binary). For one-off or README steps that the manifest does not cover, use this or `send_integrated_terminal`.",
         parameters: {
           type: "object",
           properties: {
-            program: { type: "string" },
+            program: { type: "string", description: "Executable (omit if using **cmd**)." },
+            cmd: {
+              type: "string",
+              description: "Single shell line → **bash -c** (same as **run_command**).",
+            },
             args: {
               type: "array",
               items: { type: "string" },
@@ -234,7 +246,58 @@ export function getOllamaTools(): unknown[] {
             },
             cwd: { type: "string", description: "Working directory; must be allowlisted if set" },
           },
-          required: ["program"],
+          required: [],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "terminal_output",
+        description:
+          "**Not** a read of live terminal I/O. Returns a static reminder. The model **does not** receive the integrated terminal’s live stdout/stderr in the next turn. **Prefer:** `list_directory` and `read_text_file` on files under the workspace (e.g. `Intelx_Crawler/csv_output/`), or ask the user to paste. To **start** IntelX use `run_trusted_workflow` with `workflow: \"intelx\"`, not `run` with `program: \"intelx\"`.",
+        parameters: {
+          type: "object",
+          properties: {
+            _unused: {
+              type: "string",
+              description: "Ignored. Some models call this with empty arguments.",
+            },
+          },
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "system_maintenance_status",
+        description:
+          "Return **read-only** persisted maintenance JSON: `version`, `globalLock`, and `projects` map (keys = workspace folder ids). Each project has ISO-8601 `lastSuccessfulSync` / `nextScheduledSync`, `currentStatus` (idle | running | degraded | failed | stale), `lastExitCode`, `lastErrorLog`, `metrics`, and `artifacts` (`expectedOutputFile`, `lastVerifiedExistence`). Includes CVE / NVD, IOCs crawler, ASM fetch, and IntelX (`Intelx_Crawler` + `csv_output/` handshake). **Prefer this** to inspect sync state for “last update” questions. **Do not** fake this data with **write_text_file** — to refresh data, use **run_trusted_workflow** or **send_integrated_terminal** per project README after approval.",
+        parameters: {
+          type: "object",
+          properties: {
+            _unused: {
+              type: "string",
+              description: "Ignored.",
+            },
+          },
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "sync_cti_vault_cves_to_iocs",
+        description:
+          "Copy CVE rows from the workspace **`cti_vault.db`** table **`cve_data`** into the app’s local **`iocs`** SQLite (`ioc_type`: **`cve`**, global rows). Use after **`run_trusted_workflow`** / terminal **`CVE_Project_NVD`** runs complete so **ioc_search** and the UI see new CVEs. The host may also schedule merges automatically for CVE workflows — call again if the NVD job was very long. Optional **limit** caps rows (default 100000, max 500000).",
+        parameters: {
+          type: "object",
+          properties: {
+            limit: {
+              type: "integer",
+              description: "Max CVE rows to read from the vault (omit = 100000; hard cap 500000).",
+            },
+          },
         },
       },
     },
@@ -412,7 +475,7 @@ export function getOllamaTools(): unknown[] {
       function: {
         name: "api_request",
         description:
-          "Call an external **HTTPS** API with the shared rate limiter and response cache. **api_name** (e.g. `virustotal`, `shodan`) must match a key in settings / `.api_keys.json` and drives quotas. You still pass **url** and **headers** (e.g. `x-apikey`) yourself. Returns JSON with **status**, **fromCache**, **body**.",
+          "Call an external **HTTPS** API with the shared rate limiter and response cache—this is the primary host path when the user **explicitly** asks for web/API/online data (per-request outbound access, not a hidden browser). **api_name** (e.g. `virustotal`, `shodan`) must match a key in settings / `.api_keys.json` and drives quotas. You still pass **url** and **headers** (e.g. `x-apikey`) yourself. Returns JSON with **status**, **fromCache**, **body**.",
         parameters: {
           type: "object",
           properties: {

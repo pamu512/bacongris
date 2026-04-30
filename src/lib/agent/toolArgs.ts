@@ -1,3 +1,5 @@
+import { stripMarkdownCodeFenceFromToolArgs } from "./ollamaMessages";
+
 /**
  * Ollama sometimes returns function.arguments as a JSON string, sometimes as an object.
  * If we only JSON.parse strings, object form becomes {} and paths are empty → "invalid path :".
@@ -8,7 +10,7 @@ export function parseToolArguments(raw: unknown): Record<string, unknown> {
     return { ...(raw as Record<string, unknown>) };
   }
   if (typeof raw === "string") {
-    const s = raw.trim();
+    const s = stripMarkdownCodeFenceFromToolArgs(raw);
     if (!s) return {};
     try {
       const v = JSON.parse(s) as unknown;
@@ -46,6 +48,12 @@ export function coercePathArg(args: Record<string, unknown>): string {
   ]);
 }
 
+/** `README.md` at workspace root is almost always wrong when the model meant a project README. */
+export function isBareWorkspaceReadmePath(path: string): boolean {
+  const n = path.replace(/^\.\/+/, "").trim();
+  return n === "README.md";
+}
+
 /** Full file body for **write_text_file** (UTF-8). */
 export function coerceFileContentArg(args: Record<string, unknown>): string {
   return pickString(args, [
@@ -58,7 +66,46 @@ export function coerceFileContentArg(args: Record<string, unknown>): string {
 }
 
 export function coerceProgramArg(args: Record<string, unknown>): string {
-  return pickString(args, ["program", "Program", "executable", "cmd", "command"]);
+  // Do not treat `cmd` / `command` here — models put full shell lines there; use resolveRunCommandProgramAndArgv.
+  return pickString(args, ["program", "Program", "executable"]);
+}
+
+/**
+ * Resolves `run_command` / `run` shape: either `program` + `args`, or a single shell line in
+ * `cmd` / `text` / `command` → `bash` + `["-c", line]`. Also fixes `program: "ls -la"` with no args.
+ */
+export function resolveRunCommandProgramAndArgv(
+  args: Record<string, unknown>,
+): { program: string; argv: string[] } | null {
+  const explicitProg = pickString(args, ["program", "Program", "executable"]);
+  const argv = getRunCommandArgv(args);
+
+  if (explicitProg && argv.length > 0) {
+    return { program: explicitProg, argv };
+  }
+
+  const shellLine = pickString(args, [
+    "cmd",
+    "text",
+    "script",
+    "shell",
+    "command",
+    "line",
+    "shell_command",
+  ]);
+  const lineTrim = shellLine.trim();
+  if (lineTrim) {
+    return { program: "bash", argv: ["-c", lineTrim] };
+  }
+
+  if (explicitProg) {
+    if (argv.length === 0 && /\s/.test(explicitProg)) {
+      return { program: "bash", argv: ["-c", explicitProg.trim()] };
+    }
+    return { program: explicitProg, argv };
+  }
+
+  return null;
 }
 
 /** run_trusted_workflow */
@@ -203,10 +250,9 @@ export function coerceTerminalDataArg(args: Record<string, unknown>): string {
 export function terminalTextFromRunCommandStyleArgs(
   args: Record<string, unknown>,
 ): string | null {
-  const program = coerceProgramArg(args);
-  if (!program) return null;
-  const argv = getRunCommandArgv(args);
-  const words = [program, ...argv];
+  const resolved = resolveRunCommandProgramAndArgv(args);
+  if (!resolved) return null;
+  const words = [resolved.program, ...resolved.argv];
   return words
     .map((w) => (/\s/.test(w) ? `"${w.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` : w))
     .join(" ");
