@@ -310,3 +310,41 @@ The user is asking about **internet or web access** (or ability to use online re
 - Answer clearly: you do **not** have a private browser or silent always-on internet—but the host allows **per-request, user-directed** outbound calls via real tools: **\`api_request\`** (HTTPS; **api_name** + **url** + **headers**; keys in Settings), **\`enrich_ioc\` / \`enrich_virustotal\` / \`enrich_shodan\` / \`enrich_otx\` / \`enrich_abusech\`**, **feeds** (\`add_feed\`, \`poll_feed\`, …), or **\`run_command\` / \`run_trusted_workflow\`** when a workspace README documents remote fetches.
 - When they **explicitly** want live or “latest” public data, **use** those tools for this request—do **not** refuse with a blanket “no internet.” If URLs or API keys are missing, say what to configure in **Settings** or ask them to paste—never invent secrets.`;
 }
+
+/**
+ * "Check the database" / "latest updates" in SQLite / recent IOCs — use ioc_search (last_seen DESC), not terminal-only.
+ */
+export function getLocalDatabaseLatestHint(userText: string): string | null {
+  const t = userText.trim();
+  if (t.length < 6) return null;
+  const lower = t.toLowerCase().replace(/\s+/g, " ");
+
+  const runCollectors =
+    /\b(run|start|execute|launch|refresh|sync|re-?sync|pull|update)\b[\s\S]{0,80}\b(all\s+)?(dataset|feeds?|crawl|collector|workflow|maintenance\s+modal)\b/.test(
+      lower,
+    );
+  if (runCollectors) return null;
+
+  const hasDb =
+    /\b(database|sqlite|\biocs?\b|cti_vault|vault\.db|\bthe\s+db\b|app\s+sqlite|local\s+sqlite)\b/.test(lower) ||
+    /\b(iocs?\s+table|stored\s+iocs?)\b/.test(lower);
+  const hasRecency =
+    /\b(latest|recent|new(est)?|updates?|new\s+rows?|last\s+seen|recency|what'?s\s+new)\b/.test(lower);
+  const hasBrowse =
+    /\b(check|show|list|view|peek|inspect|query|see|how\s+many|pull\s+up|give\s+me|what\s+is|what\s+are)\b/.test(
+      lower,
+    );
+
+  const iocRecencyBrowse =
+    /\b(recent|latest|new(est)?)\b.*\b(iocs?|indicators?)\b/.test(lower) &&
+    /\b(check|show|list|view|see|what|database|db|in\s+(the\s+)?app|stored|table)\b/.test(lower);
+
+  if (!iocRecencyBrowse && !(hasDb && (hasRecency || hasBrowse))) return null;
+
+  return `## Host routing hint (this user turn) — **Local IOC database / “latest updates”**
+The user wants to **see what is stored** or **what changed recently** in the app’s **SQLite IOC store** (\`iocs\`), not necessarily to **run** a collector this turn.
+
+- Call **\`ioc_search\`** with **\`limit\`** (e.g. **50**–**100**). Results are **ordered by \`last_seen\` descending** (newest first)—that is the default **“latest updates”** view.
+- If they need **CVE rows from \`cti_vault.db\`** that are not in \`ioc_search\` yet: **\`sync_cti_vault_cves_to_iocs\`**, then **\`ioc_search\`** with **\`ioc_type\`** \`cve\`.
+- For **per-job maintenance recency** (ASM/CVE/IOC/IntelX schedules), use **\`system_maintenance_status\`**. **Do not** treat this as a failed request if there was no **\`run_command\`** / terminal run—**\`ioc_search\`** is the correct read path.`;
+}

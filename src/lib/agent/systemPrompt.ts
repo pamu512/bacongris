@@ -4,6 +4,7 @@ import {
   getDockerComposeWorkingDirHint,
   getDatasetUpdateAndFreshnessHint,
   getExplicitWebAccessRoutingHint,
+  getLocalDatabaseLatestHint,
   getIntelxPostRunResultsHint,
   getLeakExposureRoutingHint,
   getRunCveProjectHint,
@@ -110,7 +111,7 @@ const CTI_SYSTEM_PROMPT_POST_VISUAL = `**Additional "local-first" constraints (m
 * If no files exist, tell the user 0 records were found or the run is still processing.
 
 ### LOCAL IOC DATABASE & GRAPH RULES
-* **Create/Search:** Use \`ioc_create\`, \`ioc_search\`, \`ioc_update\` for local SQLite. 
+* **Create/Search:** Use \`ioc_create\`, \`ioc_search\`, \`ioc_update\` for local SQLite. For **“check the database” / “latest updates” / “recent IOCs”**, call **\`ioc_search\`** with a suitable **limit** (rows are **newest \`last_seen\` first**). For **dataset maintenance recency** (CVE/ASM/IOC/IntelX schedules), use **\`system_maintenance_status\`**. 
 * **Filters:** \`ioc_search\` excludes false positives by default. Use \`include_false_positives: true\` if explicitly needed.
 * **Enrichment:** Use \`enrich_ioc\` for VirusTotal, Shodan, OTX. Auto-correlations apply automatically based on the source.
 * **Graph:** Use \`suggest_pivots\`, \`campaign_track\`, \`add_ioc_relationship\` for mapping entity relationships.
@@ -178,6 +179,7 @@ export async function buildCtiSystemMessageContent(
     const intelxPostRun = getIntelxPostRunResultsHint(u);
     const datasetUpdate = getDatasetUpdateAndFreshnessHint(u);
     const webAccess = getExplicitWebAccessRoutingHint(u);
+    const dbLatest = getLocalDatabaseLatestHint(u);
     if (catalog) hints.push(catalog);
     if (runCve) hints.push(runCve);
     if (runNamed) hints.push(runNamed);
@@ -187,6 +189,7 @@ export async function buildCtiSystemMessageContent(
     if (intelxPostRun) hints.push(intelxPostRun);
     if (datasetUpdate) hints.push(datasetUpdate);
     if (webAccess) hints.push(webAccess);
+    if (dbLatest) hints.push(dbLatest);
   }
   const routeBlock = hints.length > 0 ? `\n\n${hints.join("\n\n")}\n` : "";
   const goal = (options?.goalText ?? DEFAULT_GOAL).trim();

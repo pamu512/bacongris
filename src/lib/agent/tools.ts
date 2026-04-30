@@ -340,7 +340,7 @@ export function getOllamaTools(): unknown[] {
       function: {
         name: "ioc_search",
         description:
-          "Query stored IOCs. By default only rows for the **active profile** or **global** (no profile) are returned. Set **all_profiles: true** to search all profiles. **include_false_positives: true** includes rows flagged as false positives. Filters are combined with AND.",
+          "Query the app’s **SQLite `iocs` table** (stored indicators). Results are ordered by **last_seen** descending (newest / most recently touched first)—use this for **“latest updates”**, **“check the database”**, or **recent IOCs** (set **limit** e.g. 25–100; optional filters narrow the set). By default only rows for the **active profile** or **global** (no profile) are returned. Set **all_profiles: true** to search all profiles. **include_false_positives: true** includes rows flagged as false positives. Filters are combined with AND. For **CVE rows** synced from \`cti_vault.db\`, use **ioc_type** \`cve\` after **sync_cti_vault_cves_to_iocs** if needed. For **collector sync times** (ASM/CVE/IOC/IntelX), use **system_maintenance_status**.",
         parameters: {
           type: "object",
           properties: {
