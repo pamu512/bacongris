@@ -24,6 +24,10 @@ npm install
 npm run tauri dev
 ```
 
+### CTI monorepo SQLite vault (optional)
+
+This repository includes a workspace-style layout (`shared_utils/`, `CVE_Project_NVD/`, `IOCs-crawler-main/`, `ASM-fetch-main/`) and a root **`pyproject.toml`** for **`pip install -e .`**, which installs **`shared_utils`** and writes **`cti_vault.db`** at the workspace root. Python tests: `python3 -m venv .venv && . .venv/bin/activate && pip install -e . && python -m unittest discover -s tests -v`.
+
 ## Build
 
 **Default (current host, single architecture):**

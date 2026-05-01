@@ -1,10 +1,12 @@
 # CTI vault (`cti_vault_bootstrap`)
 
-**Bacongris app:** When you set a workspace that contains `pyproject.toml` at the root (this package), the host runs **`pip install -e ..` inside every top-level folder that has a `.venv`** once per workspace path, so `import shared_utils` works from each project venv. If the root has no `pyproject.toml`, binding is skipped until you add it.
+**Canonical package in a full Bacongris clone:** use the **repository root** `pyproject.toml` + `shared_utils/` + `tests/` (same layout as this folder’s Python tree — they are kept in sync in git). Prefer **`pip install -e .` from the repo root** when developing here.
+
+**Bacongris app:** When you set a workspace that contains `pyproject.toml` at the root (this package or the repo root copy), the host runs **`pip install -e .` inside every top-level folder that has a `.venv`** once per workspace path, so `import shared_utils` works from each project venv. If the root has no `pyproject.toml`, binding is skipped until you add it.
 
 **Multi-process:** WAL + `busy_timeout=30s` on all connections. Use one `CTIVault` (or `open_cti_vault()` per short task) per **process**; Celery workers get a fresh `open_cti_vault` context so connections are not held across tasks.
 
-Copy this entire folder to your **All_Scripts** (or other CTI) **workspace root** as the installable `shared_utils` package, or keep it in the Bacongris repo and copy only when distributing.
+Copy **`pyproject.toml`**, **`shared_utils/`**, and **`tests/`** from the **repo root** (or this entire folder) onto your **All_Scripts** (or other CTI) **workspace root** as the installable `shared_utils` package.
 
 ## Install (each project venv)
 

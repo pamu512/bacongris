@@ -1,13 +1,13 @@
 # Merge into `docker-compose.yml` so the container shares `cti_vault.db` with the host.
-# On Linux: export UID GID  (e.g. $(id -u) $(id -g)) or docker-compose will substitute empty.
+# Mount the **workspace / monorepo root** (parent of ASM-fetch-main), not only this folder.
+# On Linux: `export UID GID` before `docker compose` (or use numeric ids) so files on the bind mount match the host user.
 
-version: "3.8"
 services:
   asm-fetch:
     # image: your-asm-image
     user: "${UID:-1000}:${GID:-1000}"
     volumes:
-      - "./:/workspace"
+      - "../:/workspace:rw"
     environment:
-      - "CTI_VAULT_PATH=/workspace/cti_vault.db"
+      CTI_VAULT_PATH: "/workspace/cti_vault.db"
     working_dir: /workspace/ASM-fetch-main

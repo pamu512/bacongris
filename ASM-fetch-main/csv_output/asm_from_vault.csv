@@ -1,0 +1,2 @@
+asset_key,asset_target,port,protocol,last_scan_at,source_project,metadata
+placeholder:0:default,example-placeholder,443,tcp,,ASM-fetch-main,

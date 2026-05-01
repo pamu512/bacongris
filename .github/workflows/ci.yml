@@ -29,14 +29,42 @@ jobs:
           python3 scripts/workflow_runner.py --workspace /tmp/bgw --workflow ransomware --dry-run
           python3 scripts/workflow_runner.py --workspace /tmp/bgw --workflow cve --dry-run
           python3 scripts/workflow_runner.py --workspace /tmp/bgw --workflow iocs_crawler --dry-run
-      - name: CTI vault bootstrap (Python)
+      - name: CTI vault (Python)
         run: |
           set -e
-          cd cti_vault_bootstrap
-          python3 -m venv .venv
-          . .venv/bin/activate
+          python3 -m venv .venv-cti
+          . .venv-cti/bin/activate
           pip install -e . -q
           python -m unittest discover -s tests -v
+          mkdir -p CVE_Project_NVD/NVD_CVE
+          python3 - <<'PY'
+          import gzip, json, pathlib
+          p = pathlib.Path("CVE_Project_NVD/NVD_CVE/nvdcve-2.0-ci.json.gz")
+          doc = {
+            "vulnerabilities": [{
+              "cve": {
+                "id": "CVE-2099-00001",
+                "published": "2099-01-01T00:00:00.000",
+                "lastModified": "2099-01-01T00:00:00.000",
+                "descriptions": [{"lang": "en", "value": "ci smoke"}],
+              }
+            }]
+          }
+          with gzip.open(p, "wt", encoding="utf-8") as f:
+              json.dump(doc, f)
+          PY
+          (cd CVE_Project_NVD && python3 main.py --skip-download)
+          test -s CVE_Project_NVD/csv_output/nvd_from_vault.csv
+          grep -q CVE-2099-00001 CVE_Project_NVD/csv_output/nvd_from_vault.csv
+          python3 ASM-fetch-main/scan_vault.py
+          grep -q example.com ASM-fetch-main/csv_output/asm_from_vault.csv
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, str(Path("IOCs-crawler-main").resolve()))
+          import ioc_celery_vault as m
+          assert m.ioc_persist_from_task("10.0.0.2", "ipv4", {"t": "ci"}, workspace_root=Path(".").resolve())
+          PY
       - run: npm run build
 
   tauri:
